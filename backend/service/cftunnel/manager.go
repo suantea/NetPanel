@@ -7,10 +7,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,6 +116,74 @@ func (m *Manager) GetBinDir() string {
 	return filepath.Join(m.dataDir, "bin")
 }
 
+// tokenCipherKey Token 加密密钥（AES-256-GCM）。
+// 优先从环境变量 NETPANEL_CFTUNNEL_TOKEN_KEY 读取，避免硬编码密钥泄露；
+// 未设置时使用内置默认值（仅适用于开发/测试，生产部署务必覆盖）。
+var tokenCipherKey = loadTokenCipherKey()
+
+func loadTokenCipherKey() string {
+	if v := strings.TrimSpace(os.Getenv("NETPANEL_CFTUNNEL_TOKEN_KEY")); v != "" {
+		return v
+	}
+	return "netpanel-cftunnel-token-key-change-me"
+}
+
+// EncryptToken 加密 token 后存储（AES-256-GCM + 随机 nonce）。
+func EncryptToken(plain string) (string, error) {
+	if plain == "" {
+		return "", nil
+	}
+	block, err := aes.NewCipher([]byte(tokenCipherKey))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nonce, nonce, []byte(plain), nil)
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+// DecryptToken 解密存储的 token；空串原样返回，解密失败返回错误。
+func DecryptToken(encoded string) (string, error) {
+	if encoded == "" {
+		return "", nil
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("base64 解码失败: %w", err)
+	}
+	block, err := aes.NewCipher([]byte(tokenCipherKey))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(data) < gcm.NonceSize() {
+		return "", fmt.Errorf("密文长度不足")
+	}
+	nonce, ciphertext := data[:gcm.NonceSize()], data[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", fmt.Errorf("解密失败: %w", err)
+	}
+	return string(plain), nil
+}
+
+// sanitizeLog 脱敏日志中的 token 等敏感信息，防止泄露到日志/前端。
+var tokenRe = regexp.MustCompile(`(?i)(--token|token=|token\s+)[=:\s]*([A-Za-z0-9._-]{8,})`)
+
+func sanitizeLog(line string) string {
+	return tokenRe.ReplaceAllString(line, "$1 ***")
+}
+
 // StartAll 启动所有启用状态的隧道
 func (m *Manager) StartAll() {
 	var tunnels []model.CftunnelConfig
@@ -181,13 +256,13 @@ func (m *Manager) Start(id uint) error {
 	go func() {
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			logBuf.write(scanner.Text())
+			logBuf.write(sanitizeLog(scanner.Text()))
 		}
 	}()
 	go func() {
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			line := scanner.Text()
+			line := sanitizeLog(scanner.Text())
 			logBuf.write("[stderr] " + line)
 			stderrBuf.WriteString(line + "\n")
 		}
@@ -234,7 +309,7 @@ func (m *Manager) Start(id uint) error {
 	return nil
 }
 
-// Stop 停止指定隧道
+// Stop 停止指定隧道，并清理 named 模式生成的临时配置文件
 func (m *Manager) Stop(id uint) {
 	if val, ok := m.tunnels.Load(id); ok {
 		entry := val.(*processEntry)
@@ -246,6 +321,15 @@ func (m *Manager) Stop(id uint) {
 		m.tunnels.Delete(id)
 	}
 	m.db.Model(&model.CftunnelConfig{}).Where("id = ?", id).Update("status", "stopped")
+	// 清理临时配置文件（dataDir/cftunnel/tunnel-<id>.yml）
+	tmpFile := filepath.Join(m.dataDir, configDirName, fmt.Sprintf("tunnel-%d.yml", id))
+	if _, err := os.Stat(tmpFile); err == nil {
+		if rmErr := os.Remove(tmpFile); rmErr != nil {
+			m.log.Warnf("[CF隧道][%d] 清理临时配置文件失败: %v", id, rmErr)
+		} else {
+			m.log.Infof("[CF隧道][%d] 已清理临时配置文件", id)
+		}
+	}
 }
 
 // Restart 重启指定隧道
@@ -289,6 +373,12 @@ func (m *Manager) buildArgs(cfg *model.CftunnelConfig) ([]string, error) {
 		}
 		args := []string{"tunnel"}
 		configPath := cfg.ConfigFile
+		if configPath != "" {
+			// 路径注入防御：拒绝包含 .. 或绝对路径越界的配置路径
+			if err := validateConfigPath(configPath); err != nil {
+				return nil, err
+			}
+		}
 		if configPath == "" {
 			// 自动生成临时 config.yml（若凭据文件已提供）
 			if cfg.CredentialsFile != "" {
@@ -309,11 +399,28 @@ func (m *Manager) buildArgs(cfg *model.CftunnelConfig) ([]string, error) {
 		if cfg.Token == "" {
 			return nil, fmt.Errorf("token 模式需要填写 Token")
 		}
-		return []string{"tunnel", "run", "--token", cfg.Token, "--no-autoupdate"}, nil
+		// 存储的是加密后的 token，启动前解密
+		plainToken, err := DecryptToken(cfg.Token)
+		if err != nil {
+			return nil, fmt.Errorf("解密 token 失败: %w", err)
+		}
+		return []string{"tunnel", "run", "--token", plainToken, "--no-autoupdate"}, nil
 
 	default:
 		return nil, fmt.Errorf("未知模式: %q（可选 quick/named/token）", cfg.Mode)
 	}
+}
+
+// validateConfigPath 校验用户提供的配置文件路径，拒绝路径注入。
+// 仅允许 dataDir/cftunnel 目录内（或该目录下的子路径）的相对路径。
+func validateConfigPath(p string) error {
+	if strings.Contains(p, "..") {
+		return fmt.Errorf("非法配置文件路径（不允许 ..）: %q", p)
+	}
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		return fmt.Errorf("非法配置文件路径（不允许绝对路径）: %q", p)
+	}
+	return nil
 }
 
 // writeTempConfig 为 named 模式生成临时 config.yml（写入 dataDir/cftunnel/<name>.yml）

@@ -29,6 +29,9 @@ func (h *CftunnelHandler) List(c *gin.Context) {
 	h.db.Order("id desc").Find(&tunnels)
 	for i := range tunnels {
 		tunnels[i].Status = h.mgr.GetStatus(tunnels[i].ID)
+		// Token 已加密存储且 json:"-" 不返回；仅暴露是否已配置
+		tunnels[i].HasToken = tunnels[i].Token != ""
+		tunnels[i].Token = ""
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": tunnels})
 }
@@ -43,11 +46,21 @@ func (h *CftunnelHandler) Create(c *gin.Context) {
 		tunnel.Mode = "quick"
 	}
 	tunnel.Status = "stopped"
+	// token 加密后落库（json:"-" 使前端无法回读明文）
+	if tunnel.Token != "" {
+		enc, err := cftunnel.EncryptToken(tunnel.Token)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "Token 加密失败: " + err.Error()})
+			return
+		}
+		tunnel.Token = enc
+	}
 	h.db.Create(&tunnel)
 	if tunnel.Enable {
 		h.mgr.Start(tunnel.ID)
 	}
 	logger.WriteLog("info", "cftunnel", fmt.Sprintf("创建CF隧道 [%d] %s", tunnel.ID, tunnel.Name))
+	tunnel.Token = ""
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": tunnel, "message": "创建成功"})
 }
 
@@ -60,11 +73,26 @@ func (h *CftunnelHandler) Update(c *gin.Context) {
 	}
 	h.mgr.Stop(uint(id))
 	req.ID = uint(id)
+	// Token 为空表示未修改，保留原加密值；非空则重新加密
+	if req.Token != "" {
+		enc, err := cftunnel.EncryptToken(req.Token)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "Token 加密失败: " + err.Error()})
+			return
+		}
+		req.Token = enc
+	} else {
+		var old model.CftunnelConfig
+		if err := h.db.First(&old, id).Error; err == nil {
+			req.Token = old.Token
+		}
+	}
 	h.db.Save(&req)
 	if req.Enable {
 		h.mgr.Start(uint(id))
 	}
 	logger.WriteLog("info", "cftunnel", fmt.Sprintf("更新CF隧道 [%d] %s", id, req.Name))
+	req.Token = ""
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": req, "message": "更新成功"})
 }
 

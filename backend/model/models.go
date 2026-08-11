@@ -567,7 +567,12 @@ type CftunnelConfig struct {
 	// named 模式：配置文件路径（可选，默认为临时生成的 config.yml）
 	ConfigFile string `gorm:"size:500" json:"config_file"`
 	// token 模式：远程配置 token（cloudflared tunnel run --token）
-	Token string `gorm:"type:text" json:"token"`
+	// 加密存储（见 service/cftunnel 的 EncryptToken/DecryptToken），
+	// API 不返回明文（json:"-"），前端通过 HasToken 判断是否已配置
+	Token    string `gorm:"type:text" json:"-"`
+	HasToken bool   `gorm:"-" json:"has_token"`
+	// ProbeURL named 模式的 HTTP 探测地址（可选，默认 https://<tunnel>.cfargotunnel.com）
+	ProbeURL string `gorm:"size:500" json:"probe_url"`
 	// 协议：http/https，默认 http
 	Protocol  string `gorm:"size:20;default:'http'" json:"protocol"`
 	Status    string `gorm:"size:20;default:'stopped'" json:"status"`
