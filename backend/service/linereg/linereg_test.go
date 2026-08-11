@@ -61,7 +61,7 @@ func TestBuildLines(t *testing.T) {
 	db := newTestDB(t)
 	seedData(db)
 
-	lines := BuildLines(db)
+	lines := BuildLines(db, nil)
 
 	byID := make(map[string]selector.Line, len(lines))
 	for _, l := range lines {
@@ -114,7 +114,7 @@ func TestBuildLines(t *testing.T) {
 }
 
 func TestBuildLinesNilDB(t *testing.T) {
-	if lines := BuildLines(nil); len(lines) != 0 {
+	if lines := BuildLines(nil, nil); len(lines) != 0 {
 		t.Fatalf("nil db 应返回空列表, got %d", len(lines))
 	}
 }

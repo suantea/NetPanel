@@ -213,7 +213,7 @@ func startServer() *http.Server {
 	meshNodeMgr := meshnode.NewManager(db, logMeshNode)
 
 	// 线路注册中心：汇总 frp/nps/easytier/wg 入口为线路，驱动自动测速选线
-	lineregMgr := linereg.NewManager(db, log, 0)
+	lineregMgr := linereg.NewManager(db, log, 50*time.Millisecond)
 
 	wireguardMgr.StartAll()
 

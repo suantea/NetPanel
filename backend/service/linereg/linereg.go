@@ -11,6 +11,8 @@ package linereg
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,13 +110,18 @@ func (m *Manager) run(ctx context.Context) {
 
 // refresh 从数据库重建线路集合，刷新 selector 并执行一轮测速选线。
 func (m *Manager) refresh(ctx context.Context) {
-	lines := BuildLines(m.db)
+	lines := BuildLines(m.db, m.log)
 	m.selector.SetLines(lines)
 	if len(lines) == 0 {
+		m.log.Warn("[线路选择] 未找到任何可用线路，请检查各工具配置")
 		return
 	}
 	m.selector.ProbeAll(ctx)
 	sel := m.selector.Select()
+	if sel.LineID == "" {
+		m.log.Warn("[线路选择] 所有线路探测失败，当前无可用线路")
+		return
+	}
 	m.log.Infof("[线路选择] 共 %d 条线路，当前线路: %q", len(lines), sel.LineID)
 }
 
@@ -125,7 +132,9 @@ func (m *Manager) refresh(ctx context.Context) {
 //   - nps      客户端配置的 nps 桥接地址（ServerAddr:ServerPort）
 //   - easytier 客户端 ServerAddr 中的每个地址（tcp://ip:port，可多个）
 //   - wireguard 启用的对端节点 Endpoint（host:port）
-func BuildLines(db *gorm.DB) []selector.Line {
+//
+// log 可为 nil（静默模式）；传入时数据库查询失败会记录警告日志，便于排查。
+func BuildLines(db *gorm.DB, log *logrus.Logger) []selector.Line {
 	if db == nil {
 		return nil
 	}
@@ -133,7 +142,9 @@ func BuildLines(db *gorm.DB) []selector.Line {
 
 	// ---- frp 客户端 ----
 	var frpcs []model.FrpcConfig
-	if err := db.Where("enable = ?", true).Find(&frpcs).Error; err == nil {
+	if err := db.Where("enable = ?", true).Find(&frpcs).Error; err != nil {
+		logWarn(log, "[线路注册] 查询 frp 客户端配置失败: %v", err)
+	} else {
 		for _, c := range frpcs {
 			addr := joinHostPort(c.ServerAddr, c.ServerPort)
 			if addr == "" {
@@ -150,7 +161,9 @@ func BuildLines(db *gorm.DB) []selector.Line {
 
 	// ---- nps 客户端 ----
 	var npscs []model.NpsClientConfig
-	if err := db.Where("enable = ?", true).Find(&npscs).Error; err == nil {
+	if err := db.Where("enable = ?", true).Find(&npscs).Error; err != nil {
+		logWarn(log, "[线路注册] 查询 nps 客户端配置失败: %v", err)
+	} else {
 		for _, c := range npscs {
 			addr := joinHostPort(c.ServerAddr, c.ServerPort)
 			if addr == "" {
@@ -167,7 +180,9 @@ func BuildLines(db *gorm.DB) []selector.Line {
 
 	// ---- easytier 客户端（ServerAddr 可含多个入口，逗号分隔）----
 	var ets []model.EasytierClient
-	if err := db.Where("enable = ?", true).Find(&ets).Error; err == nil {
+	if err := db.Where("enable = ?", true).Find(&ets).Error; err != nil {
+		logWarn(log, "[线路注册] 查询 easytier 客户端配置失败: %v", err)
+	} else {
 		for _, c := range ets {
 			for i, raw := range strings.Split(c.ServerAddr, ",") {
 				host := stripScheme(strings.TrimSpace(raw))
@@ -186,14 +201,18 @@ func BuildLines(db *gorm.DB) []selector.Line {
 
 	// ---- wireguard 对端节点（Endpoint 为可探测的远端入口）----
 	var wgcs []model.WireguardConfig
-	if err := db.Where("enable = ?", true).Find(&wgcs).Error; err == nil {
+	if err := db.Where("enable = ?", true).Find(&wgcs).Error; err != nil {
+		logWarn(log, "[线路注册] 查询 wireguard 配置失败: %v", err)
+	} else {
 		for _, c := range wgcs {
 			var peers []model.WireguardPeer
 			if err := db.Where("wireguard_id = ? AND enable = ?", c.ID, true).Find(&peers).Error; err != nil {
+				logWarn(log, "[线路注册] 查询 wireguard 对端配置失败 (wg:%d): %v", c.ID, err)
 				continue
 			}
 			for _, p := range peers {
-				if p.Endpoint == "" {
+				// 校验 Endpoint 为合法 host:port，格式非法直接跳过（防脏数据注册为线路）
+				if _, _, err := net.SplitHostPort(p.Endpoint); err != nil {
 					continue
 				}
 				lines = append(lines, selector.Line{
@@ -209,6 +228,13 @@ func BuildLines(db *gorm.DB) []selector.Line {
 	return lines
 }
 
+// logWarn 在 log 非 nil 时输出警告日志（供 BuildLines 静默模式使用）。
+func logWarn(log *logrus.Logger, format string, args ...interface{}) {
+	if log != nil {
+		log.Warnf(format, args...)
+	}
+}
+
 // joinHostPort 拼接 host:port；host 或 port 非法时返回空串。
 func joinHostPort(host string, port int) string {
 	host = strings.TrimSpace(host)
@@ -220,10 +246,16 @@ func joinHostPort(host string, port int) string {
 
 // stripScheme 去掉地址前缀的协议与路径，仅保留 host:port。
 // 例如 "tcp://1.2.3.4:11010" -> "1.2.3.4:11010"，"udp://x:11010/path" -> "x:11010"。
+// 使用 url.Parse 解析，可正确处理多重协议前缀、路径与查询参数等脏数据。
 func stripScheme(raw string) string {
-	if i := strings.Index(raw, "://"); i >= 0 {
-		raw = raw[i+3:]
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
 	}
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	// 解析失败（如无协议前缀的纯 host:port）：去掉路径部分兜底
 	if i := strings.IndexByte(raw, '/'); i >= 0 {
 		raw = raw[:i]
 	}
