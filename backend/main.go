@@ -33,6 +33,7 @@ import (
 	"github.com/netpanel/netpanel/service/firewall"
 	"github.com/netpanel/netpanel/service/frp"
 	"github.com/netpanel/netpanel/service/linereg"
+	"github.com/netpanel/netpanel/service/mcp"
 	"github.com/netpanel/netpanel/service/meshnode"
 	"github.com/netpanel/netpanel/service/nps"
 	"github.com/netpanel/netpanel/service/portforward"
@@ -227,6 +228,14 @@ func startServer() *http.Server {
 	// 端口层切换落地：选线变化时自动重绑未绑定 Caddy/DNS 的 TCP/UDP 穿透服务
 	lineregMgr.SetPortRebinder(tunserviceMgr.RebindPort)
 
+	// MCP 服务端（本地回环，供 AI 助手配置管理与异常诊断）
+	mcpSrv := mcp.NewServer(db, log, tunserviceMgr, lineregMgr,
+		frpMgr, npsMgr, easytierMgr, wireguardMgr, cftunnelMgr, portforwardMgr,
+		":18090")
+	if err := mcpSrv.Start(); err != nil {
+		log.Errorf("MCP 服务启动失败: %v", err)
+	}
+
 	wireguardMgr.StartAll()
 
 	// 非管理员时：将数据库中所有 EasyTier 客户端/服务端的 no_tun 强制置为 true
@@ -278,6 +287,7 @@ func startServer() *http.Server {
 		WireguardMgr:   wireguardMgr,
 		MeshNodeMgr:    meshNodeMgr,
 		TunserviceMgr:  tunserviceMgr,
+		LineregMgr:     lineregMgr,
 		DnsmasqMgr:     dnsmasqMgr,
 		WolMgr:         wolMgr,
 		CertMgr:        certMgr,
@@ -333,7 +343,7 @@ func startServer() *http.Server {
 
 	// 注册停止回调（用于 service 模式的优雅关闭）
 	registerStopHandlers(log, portforwardMgr, stunMgr, frpMgr, npsMgr,
-		easytierMgr, ddnsMgr, caddyMgr, cronMgr, storageMgr, dnsmasqMgr, callbackMgr, wireguardMgr, meshNodeMgr, lineregMgr, cftunnelMgr)
+		easytierMgr, ddnsMgr, caddyMgr, cronMgr, storageMgr, dnsmasqMgr, callbackMgr, wireguardMgr, meshNodeMgr, lineregMgr, cftunnelMgr, mcpSrv)
 
 	return srv
 }
@@ -396,6 +406,7 @@ func registerStopHandlers(
 	meshNodeMgr interface{ Stop() },
 	lineregMgr interface{ Stop() },
 	cftunnelMgr interface{ StopAll() },
+	mcpSrv interface{ Stop() error },
 ) {
 	stopAllFn = func() {
 		log.Info("正在停止所有服务...")
@@ -414,6 +425,7 @@ func registerStopHandlers(
 		meshNodeMgr.Stop()
 		lineregMgr.Stop()
 		cftunnelMgr.StopAll()
+		_ = mcpSrv.Stop()
 		log.Info("所有服务已停止")
 	}
 }

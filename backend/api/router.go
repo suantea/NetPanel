@@ -16,6 +16,7 @@ import (
 	"github.com/netpanel/netpanel/service/dnsmasq"
 	"github.com/netpanel/netpanel/service/easytier"
 	"github.com/netpanel/netpanel/service/frp"
+	"github.com/netpanel/netpanel/service/linereg"
 	"github.com/netpanel/netpanel/service/nps"
 	"github.com/netpanel/netpanel/service/portforward"
 	"github.com/netpanel/netpanel/service/storage"
@@ -54,6 +55,7 @@ type RouterOptions struct {
 	WireguardMgr   *wireguard.Manager
 	MeshNodeMgr    *meshnode.Manager
 	TunserviceMgr  *tunservice.Manager
+	LineregMgr     *linereg.Manager
 }
 
 // NewRouter 创建路由
@@ -206,6 +208,11 @@ func NewRouter(opts RouterOptions) *gin.Engine {
 	auth.POST("/tunservice/:id/stop", tsHandler.Stop)
 	auth.GET("/tunservice/:id/candidates", tsHandler.Candidates)
 	auth.GET("/tunservice/:id/history", tsHandler.History)
+
+	// 线路探测策略（参数化配置）
+	lineHandler := handlers.NewLineregHandler(opts.DB, opts.Log, opts.LineregMgr)
+	auth.GET("/linereg/config", lineHandler.GetConfig)
+	auth.PUT("/linereg/config", lineHandler.UpdateConfig)
 
 	// WireGuard
 	wgHandler := handlers.NewWireguardHandler(opts.DB, opts.Log, opts.WireguardMgr)
