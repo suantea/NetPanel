@@ -108,9 +108,17 @@ func (h *TunserviceHandler) Candidates(c *gin.Context) {
 		Layer   string `json:"layer"`
 		Address string `json:"address"`
 	}
-	items := []item{}
-	// 通过 linereg 的 selector 快照获取线路（tunservice 管理器不直接暴露，
-	// 由 List 内嵌线路即可，这里保持空列表兜底）。
+	lines := h.mgr.Candidates()
+	items := make([]item, 0, len(lines))
+	for _, l := range lines {
+		items = append(items, item{
+			ID:      l.ID,
+			Name:    l.Name,
+			Tool:    l.Tool,
+			Layer:   l.Layer,
+			Address: l.Address,
+		})
+	}
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": items})
 }
 
