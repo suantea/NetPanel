@@ -185,9 +185,6 @@ func (m *Manager) lineInfo(lineID string) LineInfo {
 	}
 	// 从 selector 取静态信息（地址/工具/名称）与最近延迟
 	st := m.linereg.Selector().Snapshot()
-	if st.Current != "" {
-		// 无特殊处理：Snapshot 的 Lines 已包含全部线路
-	}
 	for _, l := range st.Lines {
 		if l.ID == lineID {
 			info.Name = l.Name
@@ -202,6 +199,30 @@ func (m *Manager) lineInfo(lineID string) LineInfo {
 	}
 	info.Status = m.toolStatus(lineID)
 	return info
+}
+
+// Candidates 返回当前可选线路列表（来自 linereg selector 快照，
+// 供前端在「服务关联线路」时选择）。
+func (m *Manager) Candidates() []LineInfo {
+	if m.linereg == nil {
+		return []LineInfo{}
+	}
+	st := m.linereg.Selector().Snapshot()
+	out := make([]LineInfo, 0, len(st.Lines))
+	for _, l := range st.Lines {
+		info := LineInfo{
+			ID:      l.ID,
+			Name:    l.Name,
+			Tool:    l.Tool,
+			Address: l.Address,
+			Layer:   layerFor(l),
+		}
+		if r, ok := st.Results[l.ID]; ok && r.Err == nil {
+			info.Latency = int64(latencyOf(r))
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 // layerFor 按工具判定线路层次：cftunnel 为域名层，其余为端口层。
