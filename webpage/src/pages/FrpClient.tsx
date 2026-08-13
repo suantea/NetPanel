@@ -39,6 +39,7 @@ import {frpcApi} from '../api'
 import {useTunnelApi} from '../contexts/TunnelApiContext'
 import StatusTag from '../components/StatusTag'
 import request from '../api/request'
+import { useTableStyle } from '../hooks/useTableStyle'
 
 const {Option} = Select
 const {Text} = Typography
@@ -63,6 +64,7 @@ const FrpClient: React.FC = () => {
     const tunnelCtx = useTunnelApi()
     const api = tunnelCtx?.api || frpcApi
     const isRemote = tunnelCtx?.isRemoteMode || false
+    const tableStyle = useTableStyle()
     const [data, setData] = useState<any[]>([])
     const [loading, setLoading] = useState(false)
     const [modalOpen, setModalOpen] = useState(false)
@@ -1055,7 +1057,7 @@ const FrpClient: React.FC = () => {
 
             <Table
                 dataSource={data} columns={columns} rowKey="id" loading={loading}
-                size="middle" style={{background: '#fff', borderRadius: 8}}
+                size="middle" style={tableStyle}
                 pagination={{pageSize: 20, showSizeChanger: true}}
             />
 

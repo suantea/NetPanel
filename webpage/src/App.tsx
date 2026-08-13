@@ -15,6 +15,8 @@ const NpsServer = lazy(() => import('./pages/NpsServer'))
 const NpsClient = lazy(() => import('./pages/NpsClient'))
 const EasytierClient = lazy(() => import('./pages/EasytierClient'))
 const EasytierServer = lazy(() => import('./pages/EasytierServer'))
+const CfTunnel = lazy(() => import('./pages/CfTunnel'))
+const TunService = lazy(() => import('./pages/TunService'))
 const Wireguard = lazy(() => import('./pages/Wireguard'))
 const Ddns = lazy(() => import('./pages/Ddns'))
 const Caddy = lazy(() => import('./pages/Caddy'))
@@ -42,6 +44,20 @@ const MeshTopology = lazy(() => import('./pages/MeshTopology'))
 const MeshEvents = lazy(() => import('./pages/MeshEvents'))
 const OAuthProviders = lazy(() => import('./pages/OAuthProviders'))
 const OAuthCallback = lazy(() => import('./pages/OAuthCallback'))
+const AiChat = lazy(() => import('./pages/AiChat'))
+const AiAssistant = lazy(() => import('./pages/AiAssistant'))
+const AiCronTask = lazy(() => import('./pages/AiCronTask'))
+const AiPlugin = lazy(() => import('./pages/AiPlugin'))
+const AiProvider = lazy(() => import('./pages/AiProvider'))
+const MonitorDashboard = lazy(() => import('./pages/MonitorDashboard'))
+const MonitorServers = lazy(() => import('./pages/MonitorServers'))
+const MonitorProbes = lazy(() => import('./pages/MonitorProbes'))
+const MonitorTasks = lazy(() => import('./pages/MonitorTasks'))
+const MonitorAlerts = lazy(() => import('./pages/MonitorAlerts'))
+const MonitorTerminal = lazy(() => import('./pages/MonitorTerminal'))
+const MonitorDDNS = lazy(() => import('./pages/MonitorDDNS'))
+const MonitorNotifications = lazy(() => import('./pages/MonitorNotifications'))
+const MonitorTunnels = lazy(() => import('./pages/MonitorTunnels'))
 
 const PageLoader: React.FC = () => (
   <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%', minHeight: 300 }}>
@@ -79,6 +95,8 @@ const App: React.FC = () => {
         <Route path="nps/client" element={<Suspense fallback={<PageLoader />}><NpsClient /></Suspense>} />
         <Route path="easytier/client" element={<Suspense fallback={<PageLoader />}><EasytierClient /></Suspense>} />
         <Route path="easytier/server" element={<Suspense fallback={<PageLoader />}><EasytierServer /></Suspense>} />
+        <Route path="cftunnel" element={<Suspense fallback={<PageLoader />}><CfTunnel /></Suspense>} />
+        <Route path="tunservice" element={<Suspense fallback={<PageLoader />}><TunService /></Suspense>} />
         <Route path="wireguard" element={<Suspense fallback={<PageLoader />}><Wireguard /></Suspense>} />
         <Route path="ddns" element={<Suspense fallback={<PageLoader />}><Ddns /></Suspense>} />
         <Route path="caddy" element={<Suspense fallback={<PageLoader />}><Caddy /></Suspense>} />
@@ -105,6 +123,20 @@ const App: React.FC = () => {
         <Route path="mesh/tunnels" element={<Suspense fallback={<PageLoader />}><MeshTunnels /></Suspense>} />
         <Route path="mesh/topology" element={<Suspense fallback={<PageLoader />}><MeshTopology /></Suspense>} />
         <Route path="mesh/events" element={<Suspense fallback={<PageLoader />}><MeshEvents /></Suspense>} />
+        <Route path="ai/chat" element={<Suspense fallback={<PageLoader />}><AiChat /></Suspense>} />
+        <Route path="ai/assistant" element={<Suspense fallback={<PageLoader />}><AiAssistant /></Suspense>} />
+        <Route path="ai/cron-task" element={<Suspense fallback={<PageLoader />}><AiCronTask /></Suspense>} />
+        <Route path="ai/plugin" element={<Suspense fallback={<PageLoader />}><AiPlugin /></Suspense>} />
+        <Route path="ai/provider" element={<Suspense fallback={<PageLoader />}><AiProvider /></Suspense>} />
+        <Route path="monitor/dashboard" element={<Suspense fallback={<PageLoader />}><MonitorDashboard /></Suspense>} />
+        <Route path="monitor/servers" element={<Suspense fallback={<PageLoader />}><MonitorServers /></Suspense>} />
+        <Route path="monitor/probes" element={<Suspense fallback={<PageLoader />}><MonitorProbes /></Suspense>} />
+        <Route path="monitor/tasks" element={<Suspense fallback={<PageLoader />}><MonitorTasks /></Suspense>} />
+        <Route path="monitor/alerts" element={<Suspense fallback={<PageLoader />}><MonitorAlerts /></Suspense>} />
+        <Route path="monitor/terminal" element={<Suspense fallback={<PageLoader />}><MonitorTerminal /></Suspense>} />
+        <Route path="monitor/ddns" element={<Suspense fallback={<PageLoader />}><MonitorDDNS /></Suspense>} />
+        <Route path="monitor/notifications" element={<Suspense fallback={<PageLoader />}><MonitorNotifications /></Suspense>} />
+        <Route path="monitor/tunnels" element={<Suspense fallback={<PageLoader />}><MonitorTunnels /></Suspense>} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>

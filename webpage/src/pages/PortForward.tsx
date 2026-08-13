@@ -30,6 +30,7 @@ import {useTranslation} from 'react-i18next'
 import {portForwardApi} from '../api'
 import {useTunnelApi} from '../contexts/TunnelApiContext'
 import StatusTag from '../components/StatusTag'
+import { useTableStyle } from '../hooks/useTableStyle'
 
 const {Text} = Typography
 const {Option} = Select
@@ -83,6 +84,7 @@ const PortForward: React.FC = () => {
     const tunnelCtx = useTunnelApi()
     const api = tunnelCtx?.api || portForwardApi
     const isRemote = tunnelCtx?.isRemoteMode || false
+    const tableStyle = useTableStyle()
     const [data, setData] = useState<PortForwardRule[]>([])
     const [loading, setLoading] = useState(false)
     const [modalOpen, setModalOpen] = useState(false)
@@ -321,7 +323,7 @@ const PortForward: React.FC = () => {
                 rowKey="id"
                 loading={loading}
                 size="middle"
-                style={{background: '#fff', borderRadius: 8}}
+                style={tableStyle}
                 pagination={{pageSize: 20, showSizeChanger: true}}
             />
 

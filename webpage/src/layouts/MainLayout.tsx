@@ -33,6 +33,13 @@ import {
     UserOutlined,
     WifiOutlined,
     FileTextOutlined,
+    RobotOutlined,
+    MessageOutlined,
+    MonitorOutlined,
+    DesktopOutlined,
+    EyeOutlined,
+    CodeOutlined,
+    NotificationOutlined,
 } from '@ant-design/icons'
 import {useTranslation} from 'react-i18next'
 import {useAppStore, wallpaperList, hasWallpaper, getWallpaperBg} from '../store/appStore'
@@ -70,7 +77,6 @@ const MainLayout: React.FC = () => {
             icon: <DashboardOutlined/>,
             label: t('menu.dashboard'),
         },
-        // ── 端口映射 ──
         {
             key: 'port-mapping',
             icon: <SwapOutlined/>,
@@ -80,9 +86,10 @@ const MainLayout: React.FC = () => {
                 {key: 'stun', icon: <WifiOutlined/>, label: t('menu.stun')},
                 {key: 'frp/client', icon: <ApiOutlined/>, label: t('menu.frpc')},
                 {key: 'frp/server', icon: <CloudServerOutlined/>, label: t('menu.frps')},
+                {key: 'cftunnel', icon: <GlobalOutlined/>, label: t('menu.cftunnel')},
+                {key: 'tunservice', icon: <ApartmentOutlined/>, label: t('menu.tunservice')},
             ],
         },
-        // ── 组网管理 ──
         {
             key: 'network',
             icon: <ApartmentOutlined/>,
@@ -95,7 +102,6 @@ const MainLayout: React.FC = () => {
                 {key: 'wireguard', icon: <SafetyOutlined/>, label: t('menu.wireguard')},
             ],
         },
-        // ── 节点管理 ──
         {
             key: 'mesh',
             icon: <ClusterOutlined/>,
@@ -107,7 +113,6 @@ const MainLayout: React.FC = () => {
                 {key: 'mesh/events', icon: <HistoryOutlined/>, label: t('menu.meshEvents')},
             ],
         },
-        // ── 网页服务 ──
         {
             key: 'web-service',
             icon: <GlobalOutlined/>,
@@ -117,7 +122,6 @@ const MainLayout: React.FC = () => {
                 {key: 'caddy', icon: <LinkOutlined/>, label: t('menu.caddy')},
             ],
         },
-        // ── 安全防护 ──
         {
             key: 'security',
             icon: <SafetyOutlined/>,
@@ -129,7 +133,6 @@ const MainLayout: React.FC = () => {
                 {key: 'security/waf', icon: <BugOutlined/>, label: t('menu.waf')},
             ],
         },
-        // ── 内网工具 ──
         {
             key: 'intranet',
             icon: <ControlOutlined/>,
@@ -141,7 +144,6 @@ const MainLayout: React.FC = () => {
                 {key: 'cron', icon: <ClockCircleOutlined/>, label: t('menu.cron')},
             ],
         },
-        // ── 域名管理 ──
         {
             key: 'domain',
             icon: <KeyOutlined/>,
@@ -155,7 +157,6 @@ const MainLayout: React.FC = () => {
 
             ],
         },
-        // ── 回调管理 ──
         {
             key: 'callback',
             icon: <BellOutlined/>,
@@ -165,7 +166,34 @@ const MainLayout: React.FC = () => {
                 {key: 'callback/task', icon: <ClockCircleOutlined/>, label: t('menu.callbackTask')},
             ],
         },
-        // ── 系统管理 ──
+        {
+            key: 'ai',
+            icon: <RobotOutlined/>,
+            label: t('menu.aiManagement'),
+            children: [
+                {key: 'ai/chat', icon: <MessageOutlined/>, label: t('menu.aiChat')},
+                {key: 'ai/assistant', icon: <RobotOutlined/>, label: t('menu.aiAssistant')},
+                {key: 'ai/cron-task', icon: <ClockCircleOutlined/>, label: t('menu.aiCronTask')},
+                {key: 'ai/plugin', icon: <ApiOutlined/>, label: t('menu.aiPlugin')},
+                {key: 'ai/provider', icon: <CloudServerOutlined/>, label: t('menu.aiProvider')},
+            ],
+        },
+        {
+            key: 'monitor',
+            icon: <MonitorOutlined/>,
+            label: t('menu.serverMonitor'),
+            children: [
+                {key: 'monitor/dashboard', icon: <DashboardOutlined/>, label: t('menu.monitorDashboard')},
+                {key: 'monitor/servers', icon: <DesktopOutlined/>, label: t('menu.monitorServers')},
+                {key: 'monitor/probes', icon: <EyeOutlined/>, label: t('menu.monitorProbes')},
+                {key: 'monitor/tasks', icon: <ClockCircleOutlined/>, label: t('menu.monitorTasks')},
+                {key: 'monitor/alerts', icon: <BellOutlined/>, label: t('menu.monitorAlerts')},
+                {key: 'monitor/ddns', icon: <GlobalOutlined/>, label: t('menu.monitorDDNS')},
+                {key: 'monitor/notifications', icon: <NotificationOutlined/>, label: t('menu.monitorNotifications')},
+                {key: 'monitor/tunnels', icon: <ApiOutlined/>, label: t('menu.monitorTunnels')},
+                {key: 'monitor/terminal', icon: <CodeOutlined/>, label: t('menu.monitorTerminal')},
+            ],
+        },
         {
             key: 'admin',
             icon: <SettingOutlined/>,
@@ -331,7 +359,7 @@ const MainLayout: React.FC = () => {
                             textAlign: 'center',
                         }}>
                             <Text style={{color: hasWp && !isDark ? 'rgba(0,0,0,0.3)' : 'rgba(255,255,255,0.2)', fontSize: 11, letterSpacing: '0.5px'}}>
-                                v0.1.0
+                                v0.2.0
                             </Text>
                         </div>
                     )}
@@ -518,6 +546,7 @@ function getOpenKeys(pathname: string): string[] {
     if (pathname.startsWith('/dnsmasq') || pathname.startsWith('/wol') || pathname.startsWith('/storage') || pathname.startsWith('/cron')) return ['intranet']
     if (pathname.startsWith('/domain')) return ['domain']
     if (pathname.startsWith('/callback')) return ['callback']
+    if (pathname.startsWith('/ai')) return ['ai']
     if (pathname.startsWith('/admin') || pathname.startsWith('/settings')) return ['admin']
     return []
 }
