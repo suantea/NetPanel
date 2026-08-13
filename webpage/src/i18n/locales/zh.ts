@@ -1569,6 +1569,15 @@ const zh = {
     latency: '延迟',
     trend: '延迟趋势',
     noHistory: '暂无历史记录',
+    probeConfig: '线路策略',
+    probeInterval: '探测间隔(秒)',
+    failureThreshold: '失败阈值(次)',
+    toleranceMs: '容差(毫秒)',
+    maxConcurrent: '并发上限',
+    lockLine: '锁定线路',
+    auto: '自动',
+    saved: '已保存',
+    loadFailed: '加载失败',
   },
   // CF 隧道
   cftunnel: {

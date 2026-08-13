@@ -454,3 +454,9 @@ export function createRemoteTunnelApi(tunnelType: string, nodeId: number, isLoca
     getPeers: (id: number) => meshNodeApi.proxyGet(nodeId, `${basePath}/${id}/peers`),
   }
 }
+
+// ===== 线路探测策略（linereg） =====
+export const lineregApi = {
+  getConfig: () => request.get('/v1/linereg/config'),
+  updateConfig: (data: any) => request.put('/v1/linereg/config', data),
+}
