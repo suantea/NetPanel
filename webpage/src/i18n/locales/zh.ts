@@ -1570,6 +1570,19 @@ const zh = {
     trend: '延迟趋势',
     noHistory: '暂无历史记录',
   },
+  // CF 隧道
+  cftunnel: {
+    mode: '模式',
+    modeQuick: 'Quick（临时隧道）',
+    modeNamed: 'Named（命名隧道）',
+    modeToken: 'Token（远程配置）',
+    localUrl: '本地服务地址',
+    tunnelName: '隧道名称',
+    credentialsFile: '凭据文件',
+    configFile: '配置文件',
+    token: 'Token',
+    quickUrl: 'Quick 入口',
+  },
 }
 
 export default zh
