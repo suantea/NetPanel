@@ -13,6 +13,7 @@ import type { ColumnsType } from 'antd/es/table'
 import dayjs from 'dayjs'
 import { adminApi } from '../api'
 import { useAppStore } from '../store/appStore'
+import { useTableStyle } from '../hooks/useTableStyle'
 
 const { Text } = Typography
 
@@ -29,6 +30,7 @@ interface UserItem {
 
 const UserManagement: React.FC = () => {
   const { username: currentUsername } = useAppStore()
+  const tableStyle = useTableStyle()
   const [loading, setLoading] = useState(false)
   const [users, setUsers] = useState<UserItem[]>([])
   const [modalOpen, setModalOpen] = useState(false)
