@@ -459,4 +459,6 @@ export function createRemoteTunnelApi(tunnelType: string, nodeId: number, isLoca
 export const lineregApi = {
   getConfig: () => request.get('/v1/linereg/config'),
   updateConfig: (data: any) => request.put('/v1/linereg/config', data),
+  rebindPending: () => request.get('/v1/linereg/rebind-pending'),
+  rebindApply: () => request.post('/v1/linereg/rebind-apply'),
 }
