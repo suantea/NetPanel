@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -314,8 +315,11 @@ func (m *Manager) Stop(id uint) {
 	if val, ok := m.tunnels.Load(id); ok {
 		entry := val.(*processEntry)
 		entry.cancel()
+		// 先检查进程是否仍在，避免对已退出进程 Kill 报错
 		if entry.cmd.Process != nil {
-			_ = entry.cmd.Process.Kill()
+			if err := entry.cmd.Process.Signal(syscall.Signal(0)); err == nil {
+				_ = entry.cmd.Process.Kill()
+			}
 		}
 		<-entry.done
 		m.tunnels.Delete(id)
