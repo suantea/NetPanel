@@ -84,6 +84,58 @@ func TestSelectPicksFastest(t *testing.T) {
 	}
 }
 
+func TestToolFilterRestrictsAutoSelection(t *testing.T) {
+	// 三条线路：a/b 属 wireguard（参与自动选线），c 属 frp（被过滤）。
+	// c 延迟最低，但过滤后不应被自动选中；手动锁定 c 仍应生效。
+	lines := []Line{
+		{ID: "a", Name: "a", Tool: "wireguard", Address: "127.0.0.1:1"},
+		{ID: "b", Name: "b", Tool: "wireguard", Address: "127.0.0.1:1"},
+		{ID: "c", Name: "c", Tool: "frp", Address: "127.0.0.1:1"},
+	}
+	f := &fakeProber{
+		latencies: map[string]time.Duration{
+			"a": 50 * time.Millisecond,
+			"b": 100 * time.Millisecond,
+			"c": 10 * time.Millisecond,
+		},
+	}
+	s := NewSelector(f, 50*time.Millisecond)
+	s.SetToolFilter([]string{"wireguard"})
+	s.SetLines(lines)
+	s.ProbeAll(context.Background())
+
+	// 自动选线：过滤后只在 wireguard 中选，a(50ms) < b(100ms) → a。
+	sel := s.Select()
+	if sel.LineID != "a" {
+		t.Fatalf("expected filtered auto-select a, got %q", sel.LineID)
+	}
+
+	// 手动锁定被过滤工具线路 c：仍应生效（不受工具过滤影响）。
+	s.Lock("c")
+	sel = s.Select()
+	if sel.LineID != "c" || !sel.Locked {
+		t.Fatalf("expected manual lock c to win, got %q locked=%v", sel.LineID, sel.Locked)
+	}
+}
+
+func TestToolFilterEmptyMeansAllTools(t *testing.T) {
+	lines := []Line{
+		{ID: "a", Name: "a", Tool: "frp", Address: "127.0.0.1:1"},
+		{ID: "b", Name: "b", Tool: "wireguard", Address: "127.0.0.1:1"},
+	}
+	f := &fakeProber{
+		latencies: map[string]time.Duration{"a": 10 * time.Millisecond, "b": 200 * time.Millisecond},
+	}
+	s := NewSelector(f, 50*time.Millisecond)
+	s.SetToolFilter(nil) // 空 = 全部参与
+	s.SetLines(lines)
+	s.ProbeAll(context.Background())
+	sel := s.Select()
+	if sel.LineID != "a" {
+		t.Fatalf("expected unfiltered fastest a, got %q", sel.LineID)
+	}
+}
+
 func TestSelectPrefersHTTPLatencyWhenProbed(t *testing.T) {
 	// b 的 TCP 握手更慢，但 HTTP 出网更快；配置了 ProbeURL 时应选 b。
 	// 覆盖 #B 修复：测速结果里的 HTTP 延迟参与选线排序。
@@ -360,4 +412,86 @@ func TestDomainHost(t *testing.T) {
 			t.Errorf("domainHost(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// TestSetToleranceChangesHysteresisWindow 验证 SetTolerance 后防抖窗口随之变化：
+// 设置大容差时，当前线路即使比最优慢很多也不切换（在容差内）。
+func TestSetToleranceChangesHysteresisWindow(t *testing.T) {
+	s, f := newFake(
+		mkLines("a", "b"),
+		map[string]time.Duration{"a": 10 * time.Millisecond, "b": 20 * time.Millisecond},
+		nil,
+	)
+	s.ProbeAll(context.Background())
+	first := s.Select()
+	if first.LineID != "a" {
+		t.Fatalf("first select should pick fastest a, got %q", first.LineID)
+	}
+
+	// 设置大容差 500ms：b 提升到 11ms（a=10，差 1ms），应保持 a
+	s.SetTolerance(500 * time.Millisecond)
+	f.latencies["b"] = 11 * time.Millisecond
+	s.ProbeAll(context.Background())
+	second := s.Select()
+	if second.LineID != "a" {
+		t.Fatalf("with large tolerance, expected keep a, got %q", second.LineID)
+	}
+
+	// 切回小容差 1µs：b 提升到 9ms（比 a=10ms 快 1ms），差距 > 容差 → 切到 b
+	s.SetTolerance(1 * time.Microsecond)
+	f.latencies["b"] = 9 * time.Millisecond
+	s.ProbeAll(context.Background())
+	third := s.Select()
+	if third.LineID != "b" {
+		t.Fatalf("with tiny tolerance, expected switch to b, got %q", third.LineID)
+	}
+}
+
+// TestProbeLinesDoesNotMutateState 验证即时测速 ProbeLines 不刷新内部选线状态：
+// 传入线路的子集测速后，内部 results/current 保持原样（不触发切换）。
+func TestProbeLinesDoesNotMutateState(t *testing.T) {
+	s, f := newFake(
+		mkLines("a", "b"),
+		map[string]time.Duration{"a": 10 * time.Millisecond, "b": 200 * time.Millisecond},
+		nil,
+	)
+	s.ProbeAll(context.Background())
+	if sel := s.Select(); sel.LineID != "a" {
+		t.Fatalf("expected current a, got %q", sel.LineID)
+	}
+
+	// 只对 b 做一次即时测速（模拟手动测速），并让 b 变得最快
+	f.latencies["b"] = 5 * time.Millisecond
+	lines := []Line{byID(t, s, "b")}
+	res := s.ProbeLines(context.Background(), lines)
+	if r, ok := res["b"]; !ok || r.Err != nil {
+		t.Fatalf("ProbeLines should return result for b, got %v", res)
+	}
+	// 内部状态未被刷新：current 仍是 a（ProbeLines 不应改变选线结果）
+	if sel := s.Select(); sel.LineID != "a" {
+		t.Fatalf("ProbeLines must not refresh selection state, current should stay a, got %q", sel.LineID)
+	}
+}
+
+// TestProbeLinesCancellation 验证 ctx 取消时 ProbeLines 返回取消结果。
+func TestProbeLinesCancellation(t *testing.T) {
+	s, _ := newFake(mkLines("a"), map[string]time.Duration{"a": 10 * time.Millisecond}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 立即取消
+	res := s.ProbeLines(ctx, mkLines("a"))
+	if r, ok := res["a"]; !ok || r.Err == nil {
+		t.Fatalf("expected canceled result for a, got %v", res)
+	}
+}
+
+// byID 从 Selector 中按 id 取 Line（测试辅助）。
+func byID(t *testing.T, s *Selector, id string) Line {
+	t.Helper()
+	for _, l := range s.Lines() {
+		if l.ID == id {
+			return l
+		}
+	}
+	t.Fatalf("line %q not found", id)
+	return Line{}
 }

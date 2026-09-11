@@ -19,6 +19,7 @@ import (
 	"github.com/netpanel/netpanel/model"
 	"github.com/netpanel/netpanel/pkg/config"
 	"github.com/netpanel/netpanel/pkg/logger"
+	"github.com/netpanel/netpanel/pkg/secret"
 	"github.com/netpanel/netpanel/pkg/svcutil"
 	"github.com/netpanel/netpanel/pkg/sysutil"
 	"github.com/netpanel/netpanel/service/access"
@@ -34,6 +35,7 @@ import (
 	"github.com/netpanel/netpanel/service/firewall"
 	"github.com/netpanel/netpanel/service/frp"
 	"github.com/netpanel/netpanel/service/linereg"
+	"github.com/netpanel/netpanel/service/mcp"
 	"github.com/netpanel/netpanel/service/meshnode"
 	"github.com/netpanel/netpanel/service/monitor"
 	"github.com/netpanel/netpanel/service/nps"
@@ -164,6 +166,13 @@ func startServer() *http.Server {
 	// 初始化配置
 	cfg := config.Init(*dataDir)
 
+	// 初始化签名密钥（JWT / session Cookie）
+	// 必须在数据库与路由之前完成：密钥缺失时拒绝启动，避免退化为硬编码默认值
+	if err := secret.Init(*dataDir); err != nil {
+		log.Fatalf("签名密钥初始化失败: %v", err)
+	}
+	log.Infof("[系统核心] 签名密钥已加载（指纹 %s）", secret.Fingerprint())
+
 	// 初始化数据库
 	db, err := model.InitDB(*dataDir)
 	if err != nil {
@@ -197,6 +206,7 @@ func startServer() *http.Server {
 	logFirewall := logger.NewDBLogger(log, "firewall")
 	logWireguard := logger.NewDBLogger(log, "wireguard")
 	logMeshNode := logger.NewDBLogger(log, "meshnode")
+	logCfTunnel := logger.NewDBLogger(log, "cftunnel")
 
 	// 初始化各服务管理器（使用带 DB Hook 的专属 logger）
 	portforwardMgr := portforward.NewManager(db, logPortforward)
@@ -204,7 +214,6 @@ func startServer() *http.Server {
 	frpMgr := frp.NewManager(db, logFrp)
 	npsMgr := nps.NewManager(db, logNps, *dataDir)
 	easytierMgr := easytier.NewManager(db, logEasytier, *dataDir)
-	cftunnelMgr := cftunnel.NewManager(db, log, *dataDir)
 	ddnsMgr := ddns.NewManager(db, logDdns)
 	caddyMgr := caddy.NewManager(db, logCaddy, *dataDir)
 	wolMgr := wol.NewManager(db, logWol)
@@ -217,6 +226,7 @@ func startServer() *http.Server {
 	firewallMgr := firewall.NewManager(db, logFirewall)
 	wireguardMgr := wireguard.NewManager(db, logWireguard, *dataDir)
 	meshNodeMgr := meshnode.NewManager(db, logMeshNode)
+	cftunnelMgr := cftunnel.NewManager(db, logCfTunnel, *dataDir)
 
 	// AI 管理器
 	logAi := logger.NewDBLogger(log, "ai")
@@ -224,7 +234,7 @@ func startServer() *http.Server {
 	
 	// 监控管理器
 	logMonitor := logger.NewDBLogger(log, "monitor")
-	monitorMgr := monitor.NewManager(db)
+	monitorMgr := monitor.NewManagerWithDataDir(db, *dataDir)
 	_ = logMonitor // 暂时不使用，预留给未来的日志集成
 
 	// WAF 引擎管理器（全局默认，供 Caddy 中间件与 Handler 使用）
@@ -241,6 +251,19 @@ func startServer() *http.Server {
 		frpMgr, npsMgr, easytierMgr, wireguardMgr, cftunnelMgr)
 	// 端口层切换落地：选线变化时自动重绑未绑定 Caddy/DNS 的 TCP/UDP 穿透服务
 	lineregMgr.SetPortRebinder(tunserviceMgr.RebindPort)
+
+	// MCP 服务端（本地回环，供 AI 助手配置管理与异常诊断）
+	mcpSrv := mcp.NewServer(db, log, tunserviceMgr, lineregMgr,
+		frpMgr, npsMgr, easytierMgr, wireguardMgr, cftunnelMgr, portforwardMgr,
+		":18090", cfg.MCPToken)
+	if err := mcpSrv.Start(); err != nil {
+		log.Errorf("MCP 服务启动失败: %v", err)
+	}
+	if cfg.MCPToken != "" {
+		log.Infof("[MCP] 访问令牌已配置（客户端需携带 Authorization: Bearer <token>），token 内容不写入日志")
+	} else {
+		log.Infof("[MCP] 未配置访问令牌，仅监听 127.0.0.1 放行")
+	}
 
 	wireguardMgr.StartAll()
 
@@ -299,6 +322,7 @@ func startServer() *http.Server {
 		WireguardMgr:   wireguardMgr,
 		MeshNodeMgr:    meshNodeMgr,
 		TunserviceMgr:  tunserviceMgr,
+		LineregMgr:     lineregMgr,
 		DnsmasqMgr:     dnsmasqMgr,
 		WolMgr:         wolMgr,
 		CertMgr:        certMgr,
@@ -355,7 +379,7 @@ func startServer() *http.Server {
 
 	// 注册停止回调（用于 service 模式的优雅关闭）
 	registerStopHandlers(log, portforwardMgr, stunMgr, frpMgr, npsMgr,
-		easytierMgr, ddnsMgr, caddyMgr, cronMgr, storageMgr, dnsmasqMgr, callbackMgr, wireguardMgr, meshNodeMgr, lineregMgr, cftunnelMgr, monitorMgr)
+		easytierMgr, ddnsMgr, caddyMgr, cronMgr, storageMgr, dnsmasqMgr, callbackMgr, wireguardMgr, meshNodeMgr, lineregMgr, cftunnelMgr, monitorMgr, mcpSrv)
 
 	return srv
 }
@@ -419,6 +443,7 @@ func registerStopHandlers(
 	lineregMgr interface{ Stop() },
 	cftunnelMgr interface{ StopAll() },
 	monitorMgr interface{ Stop() },
+	mcpSrv interface{ Stop() error },
 ) {
 	stopAllFn = func() {
 		log.Info("正在停止所有服务...")
@@ -438,6 +463,7 @@ func registerStopHandlers(
 		lineregMgr.Stop()
 		cftunnelMgr.StopAll()
 		monitorMgr.Stop()
+		_ = mcpSrv.Stop()
 		log.Info("所有服务已停止")
 	}
 }

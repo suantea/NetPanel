@@ -3,6 +3,7 @@ package wireguard
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -140,7 +141,7 @@ func (m *Manager) Start(id uint) error {
 			"status":     "error",
 			"last_error": errMsg,
 		})
-		return fmt.Errorf(errMsg)
+		return errors.New(errMsg)
 	}
 
 	m.running.Store(id, true)
@@ -265,4 +266,50 @@ func (m *Manager) ReloadConfig(id uint) error {
 		return m.Start(id)
 	}
 	return nil
+}
+
+// GetInterfaceDetail 获取 WireGuard 接口诊断信息
+func (m *Manager) GetInterfaceDetail(id uint) (map[string]interface{}, error) {
+	var cfg model.WireguardConfig
+	if err := m.db.Where("id = ?", id).First(&cfg).Error; err != nil {
+		return nil, err
+	}
+
+	var peers []model.WireguardPeer
+	m.db.Where("wireguard_id = ? AND enable = ?", id, true).Find(&peers)
+
+	var logs []model.SystemLog
+	m.db.Where("service = 'wireguard' AND message LIKE ?", "%"+cfg.Name+"%").
+		Order("log_time DESC").Limit(30).Find(&logs)
+
+	logLines := make([]string, 0, len(logs))
+	for _, l := range logs {
+		logLines = append(logLines, fmt.Sprintf("[%s] %s", l.LogTime.Format("15:04:05"), l.Message))
+	}
+
+	peerList := make([]map[string]interface{}, 0, len(peers))
+	for _, p := range peers {
+		peerList = append(peerList, map[string]interface{}{
+			"name":                   p.Name,
+			"public_key":             p.PublicKey,
+			"endpoint":               p.Endpoint,
+			"allowed_ips":            p.AllowedIPs,
+			"persistent_keepalive":   p.PersistentKeepalive,
+			"enable":                 p.Enable,
+		})
+	}
+
+	return map[string]interface{}{
+		"id":             cfg.ID,
+		"name":           cfg.Name,
+		"status":         m.GetStatus(id),
+		"last_error":     cfg.LastError,
+		"listen_port":    cfg.ListenPort,
+		"address":        cfg.Address,
+		"private_key":    "***hidden***",
+		"public_key":     cfg.PublicKey,
+		"mtu":            cfg.MTU,
+		"peers":          peerList,
+		"recent_logs":    logLines,
+	}, nil
 }

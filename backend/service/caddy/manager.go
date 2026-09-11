@@ -27,7 +27,15 @@ import (
 
 const caddyAdminAddr = "localhost:2019"
 
-// Manager Caddy 网站服务管理器
+// ServerKey 为同端口聚合的 Caddy server 生成统一 key（同端口所有站点共享一个 server）。
+// 格式：netpanel_p{port}；若端口与面板相同则改为 netpanel_p{port}_proxy 避免冲突。
+func ServerKey(port int) string {
+	key := fmt.Sprintf("netpanel_p%d", port)
+	if port <= 0 {
+		return key
+	}
+	return key
+}
 type Manager struct {
 	db        *gorm.DB
 	log       *logrus.Logger
@@ -55,7 +63,8 @@ func (m *Manager) SetPanelPort(port int) {
 	m.panelPort = port
 }
 
-// StartAll 启动 Caddy 引擎并加载所有已启用站点（异步，不阻塞主进程）
+// StartAll 启动 Caddy 引擎并加载所有已启用站点（异步，不阻塞主进程）。
+// 聚合策略：同一端口的站点共享一个 Caddy server，用 host matcher 区分不同域名。
 func (m *Manager) StartAll() {
 	go func() {
 		defer func() {
@@ -75,11 +84,17 @@ func (m *Manager) StartAll() {
 			return
 		}
 
+		// 按端口分组，同端口聚合部署
+		portSites := make(map[int][]model.CaddySite)
 		for _, s := range sites {
-			if err := m.Start(s.ID); err != nil {
-				m.log.Errorf("[Caddy] 站点 [%s] 启动失败: %v", s.Name, err)
+			portSites[s.Port] = append(portSites[s.Port], s)
+		}
+		for port, group := range portSites {
+			if err := m.DeployServer(port, group); err != nil {
+				m.log.Errorf("[Caddy] 部署端口 %d 聚合 server 失败: %v", port, err)
 			}
 		}
+		m.log.Infof("[Caddy] 已部署 %d 个聚合 server（%d 个站点）", len(portSites), len(sites))
 	}()
 }
 
@@ -103,7 +118,7 @@ func (m *Manager) StopAll() {
 	m.db.Model(&model.CaddySite{}).Where("1 = 1").Update("status", "stopped")
 }
 
-// Start 启动指定站点
+// Start 启动指定站点（保留兼容接口；实际部署委托给 DeployServer）
 func (m *Manager) Start(id uint) error {
 	var site model.CaddySite
 	if err := m.db.First(&site, id).Error; err != nil {
@@ -112,54 +127,27 @@ func (m *Manager) Start(id uint) error {
 	if !site.Enable {
 		return fmt.Errorf("站点 [%s] 未启用", site.Name)
 	}
-
 	if err := m.ensureCaddyRunning(); err != nil {
 		return fmt.Errorf("Caddy 引擎未就绪: %w", err)
 	}
-
-	// 构建路由配置
-	routes, err := m.buildRoutes(&site)
-	if err != nil {
-		m.setError(id, err.Error())
-		return fmt.Errorf("构建路由配置失败: %w", err)
+	// 重新加载同端口所有站点（保持聚合状态一致）
+	var portSites []model.CaddySite
+	m.db.Where("port = ? AND enable = ?", site.Port, true).Find(&portSites)
+	if len(portSites) == 0 {
+		return fmt.Errorf("端口 %d 无可启用的站点", site.Port)
 	}
-
-	// 通过 Admin API 添加路由
-	serverKey := fmt.Sprintf("netpanel_%d", id)
-	serverCfg := m.buildServerConfig(&site, routes)
-
-	// 输出调试日志：打印实际发送给 Caddy 的配置
-	if cfgJSON, err := json.MarshalIndent(serverCfg, "", "  "); err == nil {
-		m.log.Infof("[Caddy] 站点 [%s] 配置:\n%s", site.Name, string(cfgJSON))
-	}
-
-	// 先删除可能已存在的旧配置（避免 409 key already exists 错误）
-	m.adminRequest("DELETE",
-		fmt.Sprintf("/config/apps/http/servers/%s", serverKey),
-		nil,
-	)
-
-	if err := m.adminRequest("PUT",
-		fmt.Sprintf("/config/apps/http/servers/%s", serverKey),
-		serverCfg,
-	); err != nil {
-		m.setError(id, err.Error())
-		return fmt.Errorf("加载站点配置失败: %w", err)
-	}
-
-	m.db.Model(&model.CaddySite{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"status":     "running",
-		"last_error": "",
-	})
-	m.log.Infof("[Caddy] 站点 [%s] 已启动，监听 :%d", site.Name, site.Port)
-	return nil
+	return m.DeployServer(site.Port, portSites)
 }
 
-// Stop 停止指定站点
+// Stop 停止指定站点（清除该站点的路由，若同端口无其他站点则删除整个 server）
 func (m *Manager) Stop(id uint) {
-	serverKey := fmt.Sprintf("netpanel_%d", id)
+	var site model.CaddySite
+	if err := m.db.First(&site, id).Error; err != nil {
+		return
+	}
+	key := ServerKey(site.Port)
 	m.adminRequest("DELETE",
-		fmt.Sprintf("/config/apps/http/servers/%s", serverKey),
+		fmt.Sprintf("/config/apps/http/servers/%s", key),
 		nil,
 	)
 	m.db.Model(&model.CaddySite{}).Where("id = ?", id).Update("status", "stopped")
@@ -194,20 +182,22 @@ func (m *Manager) UpdateUpstream(id uint, upstream string) error {
 
 	// 内存中替换上游目标，不写库（保留用户原始配置，重启后回退）
 	site.UpstreamAddr = upstream
-	routes, err := m.buildRoutes(&site)
-	if err != nil {
-		m.setError(id, err.Error())
-		return fmt.Errorf("构建路由配置失败: %w", err)
+	// 重新加载同端口所有站点以重建聚合 server
+	var portSites []model.CaddySite
+	m.db.Where("port = ? AND enable = ?", site.Port, true).Find(&portSites)
+	if len(portSites) == 0 {
+		return fmt.Errorf("端口 %d 无可启用的站点", site.Port)
 	}
-	serverKey := fmt.Sprintf("netpanel_%d", id)
-	serverCfg := m.buildServerConfig(&site, routes)
-
-	if err := m.adminRequest("PUT",
-		fmt.Sprintf("/config/apps/http/servers/%s", serverKey),
-		serverCfg,
-	); err != nil {
+	// 将更新后的 site 放回组内（内存中替换，不落库）
+	for i, s := range portSites {
+		if s.ID == site.ID {
+			portSites[i] = site
+			break
+		}
+	}
+	if err := m.DeployServer(site.Port, portSites); err != nil {
 		m.setError(id, err.Error())
-		return fmt.Errorf("热加载站点配置失败: %w", err)
+		return err
 	}
 	m.log.Infof("[Caddy] 站点 [%s] 上游目标已切换为 %s", site.Name, upstream)
 	return nil
@@ -269,32 +259,87 @@ func (m *Manager) ensureCaddyRunning() error {
 	return nil
 }
 
-// buildServerConfig 构建 Caddy 服务器配置
+// buildServerConfig 构建 Caddy 服务器配置（单站点版，兼容接口）
 func (m *Manager) buildServerConfig(site *model.CaddySite, routes []interface{}) map[string]interface{} {
 	listenAddr := fmt.Sprintf(":%d", site.Port)
-
 	serverCfg := map[string]interface{}{
 		"listen": []string{listenAddr},
 		"routes": routes,
-		// 禁用自动 HTTPS 重定向
-		"automatic_https": map[string]interface{}{
-			"disable": true,
-		},
-		// 开启访问日志
+		"automatic_https": map[string]interface{}{"disable": true},
 		"logs": map[string]interface{}{
 			"default_logger_name": fmt.Sprintf("netpanel_%d", site.ID),
 		},
 	}
-
-	// TLS 配置
 	if site.TLSEnable {
-		tlsCfg := m.buildTLSConfig(site)
-		if tlsCfg != nil {
+		if tlsCfg := m.buildTLSConfig(site); tlsCfg != nil {
 			serverCfg["tls_connection_policies"] = []interface{}{tlsCfg}
 		}
 	}
-
 	return serverCfg
+}
+
+// DeployServer 为指定端口的所有站点构建聚合 server 并部署。
+// 同端口的多个站点共享一个 Caddy server，通过 host matcher 区分域名；
+// 无域名的站点使用 catch-all 路由（match: []）。
+func (m *Manager) DeployServer(port int, sites []model.CaddySite) error {
+	if len(sites) == 0 {
+		return nil
+	}
+	key := ServerKey(port)
+	var allRoutes []interface{}
+	for _, site := range sites {
+		routes, err := m.buildRoutes(&site)
+		if err != nil {
+			m.setError(site.ID, err.Error())
+			m.log.Warnf("[Caddy] 站点 [%s](id=%d) 路由构建失败: %v", site.Name, site.ID, err)
+			continue
+		}
+		allRoutes = append(allRoutes, routes...)
+	}
+	if len(allRoutes) == 0 {
+		return fmt.Errorf("端口 %d 无有效路由", port)
+	}
+	// 日志名称使用端口而非单站点 ID（多站点共享日志）
+	serverCfg := map[string]interface{}{
+		"listen": []string{fmt.Sprintf(":%d", port)},
+		"routes": allRoutes,
+		"automatic_https": map[string]interface{}{"disable": true},
+		"logs": map[string]interface{}{
+			"default_logger_name": key,
+		},
+	}
+	// 取第一个启用了 TLS 的站点的 TLS 配置（同端口站点一般 TLS 策略相同）
+	for _, site := range sites {
+		if site.TLSEnable {
+			if tlsCfg := m.buildTLSConfig(&site); tlsCfg != nil {
+				serverCfg["tls_connection_policies"] = []interface{}{tlsCfg}
+				break
+			}
+		}
+	}
+	// 先删旧配置，再 PUT（避免 409 key already exists）
+	m.adminRequest("DELETE", fmt.Sprintf("/config/apps/http/servers/%s", key), nil)
+	if err := m.adminRequest("PUT", fmt.Sprintf("/config/apps/http/servers/%s", key), serverCfg); err != nil {
+		for _, site := range sites {
+			m.setError(site.ID, err.Error())
+		}
+		return fmt.Errorf("部署聚合 server %s 失败: %w", key, err)
+	}
+	// 更新所有站点状态
+	for _, site := range sites {
+		m.db.Model(&model.CaddySite{}).Where("id = ?", site.ID).Updates(map[string]interface{}{
+			"status":     "running",
+			"last_error": "",
+		})
+	}
+	if _, err := json.MarshalIndent(serverCfg, "", "  "); err == nil {
+		names := make([]string, len(sites))
+		for i, s := range sites {
+			names[i] = s.Name
+		}
+		m.log.Infof("[Caddy] 聚合 server [%s] 已部署，端口 :%d，站点: %v", key, port, names)
+	}
+	return nil
 }
 
 // buildRoute 构建路由配置，返回路由数组

@@ -28,6 +28,27 @@ import (
 // DefaultInterval 默认的线路刷新与测速间隔。
 const DefaultInterval = 60 * time.Second
 
+// 探测参数在 SystemConfig 中的键名。
+const (
+	cfgKeyIntervalSec      = "probe_interval_sec"
+	cfgKeyFailureThreshold = "probe_failure_threshold"
+	cfgKeyToleranceMs      = "probe_tolerance_ms"
+	cfgKeyMaxConcurrent    = "probe_max_concurrent"
+	cfgKeyToolFilter       = "probe_tool_filter"
+	cfgKeyRebindMode       = "port_rebind_mode"
+)
+
+// 探测参数默认值（与 selector 默认一致）。
+const (
+	defaultIntervalSec      = 60
+	defaultFailureThreshold = 2
+	defaultToleranceMs      = 50
+	defaultMaxConcurrent    = 8
+	// minIntervalSec 探测间隔下限：过小的间隔会造成无意义的探测压力，
+	// 且 0/负数会使 time.NewTimer 直接 panic
+	minIntervalSec = 5
+)
+
 // Manager 线路注册中心：持有 selector，负责周期刷新线路并驱动测速选线。
 type Manager struct {
 	db       *gorm.DB
@@ -52,6 +73,19 @@ type Manager struct {
 	lastUpstream map[uint]string
 	lastMu       sync.Mutex
 
+	// rebindMode 端口层重绑模式："auto"（选线变化自动重绑，默认）/
+	// "manual"（半自动：只记录待重绑清单，由用户手动触发）/ "off"（关闭重绑）。
+	rebindMode string
+	// pendingRebinds manual 模式下记录待重绑的服务（svcID -> 目标线路）。
+	// 每次选线变化时更新；用户手动触发后清空。
+	pendingRebinds map[uint]string
+	pendingMu      sync.Mutex
+	// cfgMu 保护 interval 等运行期可变配置：写方为 HTTP handler goroutine，
+	// 读方为后台探测循环，无锁访问会构成 data race。
+	cfgMu sync.RWMutex
+	// reload 用于通知后台循环配置已变更，需按新间隔重排定时器
+	reload chan struct{}
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -62,12 +96,79 @@ func NewManager(db *gorm.DB, log *logrus.Logger, tolerance time.Duration) *Manag
 		log = logrus.New()
 	}
 	return &Manager{
-		db:           db,
-		log:          log,
-		interval:     DefaultInterval,
-		selector:     selector.NewSelector(nil, tolerance),
-		lastUpstream: make(map[uint]string),
+		db:             db,
+		log:            log,
+		interval:       DefaultInterval,
+		selector:       selector.NewSelector(nil, tolerance),
+		lastUpstream:   make(map[uint]string),
+		rebindMode:     RebindModeAuto,
+		pendingRebinds: make(map[uint]string),
+		reload:         make(chan struct{}, 1),
 	}
+}
+
+// 端口层重绑模式取值。
+const (
+	RebindModeAuto   = "auto"   // 选线变化自动重绑（默认）
+	RebindModeManual = "manual" // 半自动：只记录待重绑清单，由用户手动触发
+	RebindModeOff    = "off"    // 关闭端口层重绑
+)
+
+// SetRebindMode 设置端口层重绑模式。非法值忽略。
+func (m *Manager) SetRebindMode(mode string) {
+	switch mode {
+	case RebindModeAuto, RebindModeManual, RebindModeOff:
+		m.rebindMode = mode
+	}
+}
+
+// RebindMode 返回当前端口层重绑模式。
+func (m *Manager) RebindMode() string {
+	if m.rebindMode == "" {
+		return RebindModeAuto
+	}
+	return m.rebindMode
+}
+
+// PendingRebinds 返回 manual 模式下待重绑的服务（svcID -> 目标线路）快照。
+func (m *Manager) PendingRebinds() map[uint]string {
+	m.pendingMu.Lock()
+	defer m.pendingMu.Unlock()
+	out := make(map[uint]string, len(m.pendingRebinds))
+	for k, v := range m.pendingRebinds {
+		out[k] = v
+	}
+	return out
+}
+
+// ApplyPendingRebinds 手动触发所有待重绑服务（manual 模式使用）。
+// 逐个调用 portRebinder；全部成功后清空待重绑清单，返回处理数量。
+func (m *Manager) ApplyPendingRebinds() (int, error) {
+	if m.portRebinder == nil {
+		return 0, fmt.Errorf("端口层重绑回调未注入")
+	}
+	pending := m.PendingRebinds()
+	applied := 0
+	var firstErr error
+	for svcID, lineID := range pending {
+		if err := m.portRebinder(svcID, lineID); err != nil {
+			m.log.Errorf("[线路选择] 手动重绑端口层服务 %d 到线路 %s 失败: %v", svcID, lineID, err)
+			m.db.Model(&model.TunService{}).Where("id = ?", svcID).Update("last_error", err.Error())
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		m.db.Model(&model.TunService{}).Where("id = ?", svcID).Update("last_error", "")
+		m.log.Infof("[线路选择] 手动重绑端口层服务 %d 到线路 %s 成功", svcID, lineID)
+		applied++
+	}
+	if firstErr == nil {
+		m.pendingMu.Lock()
+		m.pendingRebinds = make(map[uint]string)
+		m.pendingMu.Unlock()
+	}
+	return applied, firstErr
 }
 
 // Selector 返回内部选择器，供 API / UI 读取状态或手动锁线。
@@ -75,11 +176,36 @@ func (m *Manager) Selector() *selector.Selector {
 	return m.selector
 }
 
-// SetInterval 设置线路刷新间隔（须在 Start 前调用）。
+// SetProber 透传设置探测器（测试注入 / 即时测速复用）。
+func (m *Manager) SetProber(p selector.Prober) {
+	m.selector.SetProber(p)
+}
+
+// SetInterval 设置线路刷新间隔。支持运行期热更新：
+// 写入后会唤醒后台循环，使新间隔在下一轮生效，无需重启进程。
 func (m *Manager) SetInterval(d time.Duration) {
-	if d > 0 {
-		m.interval = d
+	if d <= 0 {
+		return
 	}
+	m.cfgMu.Lock()
+	m.interval = d
+	m.cfgMu.Unlock()
+
+	// 通知后台循环按新间隔重排定时器（非阻塞，避免未启动时卡住）
+	select {
+	case m.reload <- struct{}{}:
+	default:
+	}
+}
+
+// currentInterval 读取当前刷新间隔（加锁，避免与 SetInterval 形成 data race）。
+func (m *Manager) currentInterval() time.Duration {
+	m.cfgMu.RLock()
+	defer m.cfgMu.RUnlock()
+	if m.interval <= 0 {
+		return DefaultInterval
+	}
+	return m.interval
 }
 
 // SetMaxConcurrent 透传设置探测并发上限（须在 Start 前调用）。
@@ -90,6 +216,98 @@ func (m *Manager) SetMaxConcurrent(n int) {
 // SetFailureThreshold 透传设置连续失败阈值（须在 Start 前调用）。
 func (m *Manager) SetFailureThreshold(n int) {
 	m.selector.SetFailureThreshold(n)
+}
+
+// SetTolerance 透传设置选线防抖容差（须在 Start 前调用）。
+func (m *Manager) SetTolerance(d time.Duration) {
+	m.selector.SetTolerance(d)
+}
+
+// SetToolFilter 设置参与自动选线的工具集合（逗号分隔的工具名；空 = 全部）。
+// 透传到 selector，仅 Tool 命中的线路参与自动选线，其余线路仍可展示/手动锁定。
+func (m *Manager) SetToolFilter(filter string) {
+	var tools []string
+	for _, t := range strings.Split(filter, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			tools = append(tools, t)
+		}
+	}
+	m.selector.SetToolFilter(tools)
+}
+
+// loadConfigInt 读取单个整型配置项，缺失或非法时返回默认值。
+//
+// 关键：每次查询必须使用**全新的局部变量**。原实现复用同一个
+// model.SystemConfig 变量做四次 First 查询，第一次查询后该变量的主键 ID
+// 已被填充，GORM 会把主键并入后续查询的 WHERE 条件
+// （变成 `WHERE key = ? AND id = <前一条的ID>`），导致后三项配置
+// 必然查不到而静默退回默认值——表现为 UI 显示的值与实际运行值不一致。
+func loadConfigInt(db *gorm.DB, key string, def int) int {
+	var cfg model.SystemConfig
+	if err := db.Where("key = ?", key).First(&cfg).Error; err != nil {
+		return def
+	}
+	v, err := strconv.Atoi(cfg.Value)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// loadConfigStr 读取单个字符串配置项，缺失时返回默认值。
+// 与 loadConfigInt 相同，必须使用全新的局部变量避免 GORM 主键污染。
+func loadConfigStr(db *gorm.DB, key string, def string) string {
+	var cfg model.SystemConfig
+	if err := db.Where("key = ?", key).First(&cfg).Error; err != nil {
+		return def
+	}
+	return cfg.Value
+}
+
+// LoadProbeConfig 从 SystemConfig 读取探测策略四项参数并应用。
+// 缺失的键使用默认值。
+func (m *Manager) LoadProbeConfig() error {
+	if m.db == nil {
+		return nil
+	}
+
+	intervalSec := loadConfigInt(m.db, cfgKeyIntervalSec, defaultIntervalSec)
+	failureThreshold := loadConfigInt(m.db, cfgKeyFailureThreshold, defaultFailureThreshold)
+	toleranceMs := loadConfigInt(m.db, cfgKeyToleranceMs, defaultToleranceMs)
+	maxConcurrent := loadConfigInt(m.db, cfgKeyMaxConcurrent, defaultMaxConcurrent)
+
+	// 下限校验：interval 为 0 或负数会导致 time.NewTimer panic；
+	// 其余参数非正数会使探测行为异常
+	if intervalSec < minIntervalSec {
+		m.log.Warnf("[线路选择] 探测间隔 %ds 过小，已修正为 %ds", intervalSec, minIntervalSec)
+		intervalSec = minIntervalSec
+	}
+	if failureThreshold <= 0 {
+		failureThreshold = defaultFailureThreshold
+	}
+	if toleranceMs < 0 {
+		toleranceMs = defaultToleranceMs
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrent
+	}
+	toolFilter := loadConfigStr(m.db, cfgKeyToolFilter, "")
+	rebindMode := loadConfigStr(m.db, cfgKeyRebindMode, RebindModeAuto)
+
+	m.SetInterval(time.Duration(intervalSec) * time.Second)
+	m.SetFailureThreshold(failureThreshold)
+	m.SetTolerance(time.Duration(toleranceMs) * time.Millisecond)
+	m.SetMaxConcurrent(maxConcurrent)
+	m.SetRebindMode(rebindMode)
+	// 工具过滤：逗号分隔的工具名列表；空 = 全部工具参与自动选线。
+	var tools []string
+	for _, t := range strings.Split(toolFilter, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			tools = append(tools, t)
+		}
+	}
+	m.selector.SetToolFilter(tools)
+	return nil
 }
 
 // SetCaddyUpdater 注入 Caddy 反代目标切换回调（域名层切换落地）。
@@ -113,6 +331,12 @@ func (m *Manager) SetPortRebinder(fn func(svcID uint, lineID string) error) {
 
 // Start 启动后台守护：立即执行一轮刷新与测速，之后按 interval 周期循环。
 func (m *Manager) Start() {
+	// 启动前加载探测策略参数（覆盖默认值）
+	if m.db != nil {
+		if err := m.LoadProbeConfig(); err != nil {
+			m.log.Warnf("[线路选择] 加载探测策略失败，使用默认值: %v", err)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.wg.Add(1)
@@ -133,14 +357,28 @@ func (m *Manager) Stop() {
 func (m *Manager) run(ctx context.Context) {
 	defer m.wg.Done()
 	m.refresh(ctx)
-	ticker := time.NewTicker(m.interval)
-	defer ticker.Stop()
+
+	// 使用 Timer 而非 Ticker：SetInterval 修改间隔后可立即按新值重排，
+	// 原实现在 run 入口固定创建 Ticker，导致间隔修改必须重启进程才生效。
+	timer := time.NewTimer(m.currentInterval())
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-m.reload:
+			// 间隔配置已变更：立即按新间隔重排
+			if !timer.Stop() {
+				// 抽干已触发但未消费的信号，避免立即重复执行
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(m.currentInterval())
+		case <-timer.C:
 			m.refresh(ctx)
+			timer.Reset(m.currentInterval())
 		}
 	}
 }
@@ -163,61 +401,88 @@ func (m *Manager) refresh(ctx context.Context) {
 	m.log.Infof("[线路选择] 共 %d 条线路，当前线路: %q", len(lines), sel.LineID)
 }
 
+// effectiveLine 返回某服务在本次选线中的有效线路。
+// 若服务设置了 LockedLine 且该线路存在于其 LineRefs，则使用 LockedLine
+// （服务级锁线优先于全局选线）；否则使用全局选中线路 globalLineID。
+func (m *Manager) effectiveLine(svc model.TunService, globalLineID string) string {
+	if svc.LockedLine != "" {
+		var refs []string
+		if err := json.Unmarshal([]byte(svc.LineRefs), &refs); err == nil {
+			for _, ref := range refs {
+				if ref == svc.LockedLine {
+					return svc.LockedLine
+				}
+			}
+		}
+	}
+	return globalLineID
+}
+
 // applyCaddySwitch 将当前选中线路的入口地址同步到绑定了该线路的 Caddy 站点。
 // 通过 caddyUpdater 回调（main.go 注入）热加载 Caddy 反代目标，实现域名层自动切换。
 func (m *Manager) applyCaddySwitch(lineID string) {
 	if lineID == "" || m.caddyUpdater == nil {
 		return
 	}
-	// 找到选中线路的地址（作为 Caddy 反代目标入口）
-	var line selector.Line
-	for _, l := range m.selector.Lines() {
-		if l.ID == lineID {
-			line = l
-			break
-		}
-	}
-	if line.Address == "" {
-		return
-	}
-	// 查找绑定了 Caddy 站点且 LineRefs 包含该线路的服务
+	// 查找绑定了 Caddy 站点的服务
 	var services []model.TunService
 	if err := m.db.Where("caddy_site_id > ?", 0).Find(&services).Error; err != nil {
 		m.log.Warnf("[线路选择] 查询绑定 Caddy 的服务失败: %v", err)
 		return
 	}
 	for _, svc := range services {
+		// 服务级锁线：若 LockedLine 存在于 LineRefs，使用锁定线路；否则用全局线路
+		effLineID := m.effectiveLine(svc, lineID)
+		if effLineID == "" {
+			continue
+		}
+		// 找到有效线路的地址（作为 Caddy 反代目标入口）
+		var line selector.Line
+		for _, l := range m.selector.Lines() {
+			if l.ID == effLineID {
+				line = l
+				break
+			}
+		}
+		if line.Address == "" {
+			continue
+		}
+		// 校验该有效线路确实在服务的 LineRefs 中
 		var refs []string
 		if err := json.Unmarshal([]byte(svc.LineRefs), &refs); err != nil {
 			continue
 		}
+		found := false
 		for _, ref := range refs {
-			if ref != lineID {
-				continue
+			if ref == effLineID {
+				found = true
+				break
 			}
-			if err := m.caddyUpdater(svc.CaddySiteID, line.Address); err != nil {
-				m.log.Errorf("[线路选择] 更新 Caddy 站点 %d 失败: %v", svc.CaddySiteID, err)
-				// 回滚到上一次成功切换的上游目标，避免 Caddy 与新线路不一致
-				m.lastMu.Lock()
-				old, ok := m.lastUpstream[svc.CaddySiteID]
-				m.lastMu.Unlock()
-				if ok && old != "" && old != line.Address {
-					if rerr := m.caddyUpdater(svc.CaddySiteID, old); rerr != nil {
-						m.log.Errorf("[线路选择] 回滚 Caddy 站点 %d 到 %s 失败: %v", svc.CaddySiteID, old, rerr)
-					} else {
-						m.log.Warnf("[线路选择] Caddy 站点 %d 已回滚到 %s", svc.CaddySiteID, old)
-					}
+		}
+		if !found {
+			continue
+		}
+		if err := m.caddyUpdater(svc.CaddySiteID, line.Address); err != nil {
+			m.log.Errorf("[线路选择] 更新 Caddy 站点 %d 失败: %v", svc.CaddySiteID, err)
+			// 回滚到上一次成功切换的上游目标，避免 Caddy 与新线路不一致
+			m.lastMu.Lock()
+			old, ok := m.lastUpstream[svc.CaddySiteID]
+			m.lastMu.Unlock()
+			if ok && old != "" && old != line.Address {
+				if rerr := m.caddyUpdater(svc.CaddySiteID, old); rerr != nil {
+					m.log.Errorf("[线路选择] 回滚 Caddy 站点 %d 到 %s 失败: %v", svc.CaddySiteID, old, rerr)
+				} else {
+					m.log.Warnf("[线路选择] Caddy 站点 %d 已回滚到 %s", svc.CaddySiteID, old)
 				}
-				// 记录错误供 UI 排查
-				m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", err.Error())
-			} else {
-				m.lastMu.Lock()
-				m.lastUpstream[svc.CaddySiteID] = line.Address
-				m.lastMu.Unlock()
-				m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", "")
-				m.log.Infof("[线路选择] Caddy 站点 %d 反代目标已切换为 %s", svc.CaddySiteID, line.Address)
 			}
-			break
+			// 记录错误供 UI 排查
+			m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", err.Error())
+		} else {
+			m.lastMu.Lock()
+			m.lastUpstream[svc.CaddySiteID] = line.Address
+			m.lastMu.Unlock()
+			m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", "")
+			m.log.Infof("[线路选择] Caddy 站点 %d 反代目标已切换为 %s", svc.CaddySiteID, line.Address)
 		}
 	}
 }
@@ -229,42 +494,52 @@ func (m *Manager) applyDNSSwitch(lineID string) {
 	if lineID == "" || m.dnsUpdater == nil {
 		return
 	}
-	// 找到选中线路的地址，仅对 IP 入口做 DNS 切换
-	var line selector.Line
-	for _, l := range m.selector.Lines() {
-		if l.ID == lineID {
-			line = l
-			break
-		}
-	}
-	host := lineHost(line.Address)
-	if host == "" || net.ParseIP(host) == nil {
-		return
-	}
-	// 查找配置了 Domain 且 LineRefs 包含该线路的服务
+	// 查找配置了 Domain 的服务
 	var services []model.TunService
 	if err := m.db.Where("domain != ?", "").Find(&services).Error; err != nil {
 		m.log.Warnf("[线路选择] 查询配置域名服务失败: %v", err)
 		return
 	}
 	for _, svc := range services {
+		// 服务级锁线：若 LockedLine 存在于 LineRefs，使用锁定线路；否则用全局线路
+		effLineID := m.effectiveLine(svc, lineID)
+		if effLineID == "" {
+			continue
+		}
+		// 找到有效线路的地址，仅对 IP 入口做 DNS 切换
+		var line selector.Line
+		for _, l := range m.selector.Lines() {
+			if l.ID == effLineID {
+				line = l
+				break
+			}
+		}
+		host := lineHost(line.Address)
+		if host == "" || net.ParseIP(host) == nil {
+			continue
+		}
+		// 校验该有效线路确实在服务的 LineRefs 中
 		var refs []string
 		if err := json.Unmarshal([]byte(svc.LineRefs), &refs); err != nil {
 			continue
 		}
+		found := false
 		for _, ref := range refs {
-			if ref != lineID {
-				continue
+			if ref == effLineID {
+				found = true
+				break
 			}
-			if err := m.dnsUpdater(svc.Domain, host); err != nil {
-				m.log.Warnf("[线路选择] 更新 DNS 解析 %s -> %s 失败: %v", svc.Domain, host, err)
-				// 记录错误供 UI 排查
-				m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", err.Error())
-			} else {
-				m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", "")
-				m.log.Infof("[线路选择] DNS 解析 %s -> %s 已切换", svc.Domain, host)
-			}
-			break
+		}
+		if !found {
+			continue
+		}
+		if err := m.dnsUpdater(svc.Domain, host); err != nil {
+			m.log.Warnf("[线路选择] 更新 DNS 解析 %s -> %s 失败: %v", svc.Domain, host, err)
+			// 记录错误供 UI 排查
+			m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", err.Error())
+		} else {
+			m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", "")
+			m.log.Infof("[线路选择] DNS 解析 %s -> %s 已切换", svc.Domain, host)
 		}
 	}
 }
@@ -278,29 +553,52 @@ func (m *Manager) applyPortSwitch(lineID string) {
 	if lineID == "" || m.portRebinder == nil {
 		return
 	}
+	// off 模式：关闭端口层重绑，直接返回。
+	if m.RebindMode() == RebindModeOff {
+		return
+	}
 	var services []model.TunService
 	if err := m.db.Where("caddy_site_id = ? AND (domain IS NULL OR domain = '')", 0).Find(&services).Error; err != nil {
 		m.log.Warnf("[线路选择] 查询端口层服务失败: %v", err)
 		return
 	}
 	for _, svc := range services {
+		// 服务级锁线：若 LockedLine 存在于 LineRefs，使用锁定线路；否则用全局线路
+		effLineID := m.effectiveLine(svc, lineID)
+		if effLineID == "" {
+			continue
+		}
+		// 校验该有效线路确实在服务的 LineRefs 中
 		var refs []string
 		if err := json.Unmarshal([]byte(svc.LineRefs), &refs); err != nil {
 			continue
 		}
+		found := false
 		for _, ref := range refs {
-			if ref != lineID {
-				continue
+			if ref == effLineID {
+				found = true
+				break
 			}
-			if err := m.portRebinder(svc.ID, lineID); err != nil {
-				m.log.Errorf("[线路选择] 端口层服务 %d 重绑线路 %s 失败: %v", svc.ID, lineID, err)
-				// 记录错误供 UI 排查
-				m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", err.Error())
-			} else {
-				m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", "")
-				m.log.Infof("[线路选择] 端口层服务 %d 已重绑到线路 %s", svc.ID, lineID)
-			}
-			break
+		}
+		if !found {
+			continue
+		}
+		// manual 模式：只记录待重绑清单（svcID -> 目标线路），不自动停起；
+		// 由用户通过 ApplyPendingRebinds 手动触发（避免自动重建带来抖动）。
+		if m.RebindMode() == RebindModeManual {
+			m.pendingMu.Lock()
+			m.pendingRebinds[svc.ID] = effLineID
+			m.pendingMu.Unlock()
+			m.log.Infof("[线路选择] manual 模式：端口层服务 %d 待重绑到线路 %s（等待手动触发）", svc.ID, effLineID)
+			continue
+		}
+		if err := m.portRebinder(svc.ID, effLineID); err != nil {
+			m.log.Errorf("[线路选择] 端口层服务 %d 重绑线路 %s 失败: %v", svc.ID, effLineID, err)
+			// 记录错误供 UI 排查
+			m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", err.Error())
+		} else {
+			m.db.Model(&model.TunService{}).Where("id = ?", svc.ID).Update("last_error", "")
+			m.log.Infof("[线路选择] 端口层服务 %d 已重绑到线路 %s", svc.ID, effLineID)
 		}
 	}
 }
@@ -320,18 +618,18 @@ func lineHost(address string) string {
 // maxHistoryPerLine 每条线路保留的探测历史上限
 const maxHistoryPerLine = 200
 
-// saveHistory 将最近一次探测结果写入历史表，并清理每线路超出上限的最旧记录。
+// saveHistory 将最近一次探测结果批量写入历史表，并清理每线路超出上限的最旧记录。
 func (m *Manager) saveHistory() {
 	st := m.selector.Snapshot()
-	lines := st.Lines
+	// 先建 ID→Line 索引，避免后续嵌套 O(N²) 扫描
+	lnIdx := make(map[string]selector.Line, len(st.Lines))
+	for _, l := range st.Lines {
+		lnIdx[l.ID] = l
+	}
+	// 批量批量写，避免 N 条记录走 N 次 INSERT + N 次 COUNT/DELETE
+	var batch []model.ProbeHistory
 	for id, r := range st.Results {
-		var line selector.Line
-		for _, l := range lines {
-			if l.ID == id {
-				line = l
-				break
-			}
-		}
+		line := lnIdx[id]
 		rec := model.ProbeHistory{
 			LineID:      id,
 			Tool:        line.Tool,
@@ -344,11 +642,18 @@ func (m *Manager) saveHistory() {
 		if r.Err != nil {
 			rec.ErrorMsg = r.Err.Error()
 		}
-		if err := m.db.Create(&rec).Error; err != nil {
-			m.log.Warnf("[线路选择] 写入探测历史失败 (%s): %v", id, err)
-			continue
-		}
-		m.pruneHistory(id)
+		batch = append(batch, rec)
+	}
+	if len(batch) == 0 {
+		return
+	}
+	if err := m.db.Create(&batch).Error; err != nil {
+		m.log.Warnf("[线路选择] 批量写入探测历史失败: %v", err)
+		return
+	}
+	// 每条线路单独清超出上限的记录（不同线路互不影响，必须逐个执行）
+	for _, line := range st.Lines {
+		m.pruneHistory(line.ID)
 	}
 }
 
@@ -363,6 +668,24 @@ func (m *Manager) pruneHistory(lineID string) {
 	}
 	excess := count - maxHistoryPerLine
 	m.db.Where("line_id = ?", lineID).Order("id asc").Limit(int(excess)).Delete(&model.ProbeHistory{})
+}
+
+// History 返回指定线路的探测历史（延迟趋势），按时间正序排列，供前端趋势图使用。
+// limit <= 0 或 > 500 时默认取 100 条；lineID 不存在则返回空 map。
+func (m *Manager) History(lineID string, limit int) ([]model.ProbeHistory, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var history []model.ProbeHistory
+	if err := m.db.Where("line_id = ?", lineID).
+		Order("id desc").Limit(limit).Find(&history).Error; err != nil {
+		return nil, err
+	}
+	// 时间正序（趋势图从左到右）
+	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
+		history[i], history[j] = history[j], history[i]
+	}
+	return history, nil
 }
 
 // BuildLines 从数据库汇总各工具「启用且入口可用」的线路。

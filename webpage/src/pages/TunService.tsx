@@ -24,9 +24,12 @@ import {
     PlusOutlined,
     ReloadOutlined,
     StopOutlined,
+    SettingOutlined,
+    ThunderboltOutlined,
 } from '@ant-design/icons'
 import {useTranslation} from 'react-i18next'
-import {tunserviceApi} from '../api'
+import ReactECharts from 'echarts-for-react'
+import {lineregApi, tunserviceApi} from '../api'
 import StatusTag from '../components/StatusTag'
 
 const {Option} = Select
@@ -54,7 +57,19 @@ const TunService: React.FC = () => {
     const [detailOpen, setDetailOpen] = useState(false)
     const [detail, setDetail] = useState<any>(null)
     const [history, setHistory] = useState<Record<string, any[]>>({})
+    // 线路趋势图弹窗状态
+    const [lineTrendOpen, setLineTrendOpen] = useState(false)
+    const [lineTrendLineId, setLineTrendLineId] = useState<string>('')
+    const [lineTrendData, setLineTrendData] = useState<any[]>([])
+    const [lineTrendLoading, setLineTrendLoading] = useState(false)
     const [form] = Form.useForm()
+    const [probeOpen, setProbeOpen] = useState(false)
+    const [probeLoading, setProbeLoading] = useState(false)
+    const [probeForm] = Form.useForm()
+    const [speedtestOpen, setSpeedtestOpen] = useState(false)
+    const [speedtestLoading, setSpeedtestLoading] = useState(false)
+    const [speedtestRow, setSpeedtestRow] = useState<any>(null)
+    const [speedtestData, setSpeedtestData] = useState<any[]>([])
 
     const load = async () => {
         setLoading(true)
@@ -145,6 +160,76 @@ const TunService: React.FC = () => {
         }
     }
 
+    const openProbe = async () => {
+        setProbeOpen(true)
+        setProbeLoading(true)
+        try {
+            const res = await lineregApi.getConfig()
+            probeForm.setFieldsValue({
+                interval_sec: res?.data?.interval_sec ?? 60,
+                failure_threshold: res?.data?.failure_threshold ?? 2,
+                tolerance_ms: res?.data?.tolerance_ms ?? 50,
+                max_concurrent: res?.data?.max_concurrent ?? 8,
+                tool_filter: res?.data?.tool_filter ?? '',
+                rebind_mode: res?.data?.rebind_mode ?? 'auto',
+            })
+        } catch {
+            // 加载失败时回填默认值，用户仍可直接修改后保存
+            probeForm.setFieldsValue({
+                interval_sec: 60,
+                failure_threshold: 2,
+                tolerance_ms: 50,
+                max_concurrent: 8,
+            })
+            message.warning(t('tunservice.loadFailedFallback'))
+        } finally {
+            setProbeLoading(false)
+        }
+    }
+
+    const saveProbe = async () => {
+        const values = await probeForm.validateFields()
+        try {
+            await lineregApi.updateConfig(values)
+            message.success(t('tunservice.saved'))
+            setProbeOpen(false)
+        } catch (e: any) {
+            message.error(e?.response?.data?.message || t('common.failed'))
+        }
+    }
+
+    // 半自动模式：手动触发全部待重绑的端口层服务（先提示数量，再执行）。
+    const applyPendingRebinds = async () => {
+        try {
+            const pending = await lineregApi.rebindPending()
+            const n = Object.keys(pending?.data || {}).length
+            if (n === 0) {
+                message.info(t('tunservice.rebindApplied', {n: 0}))
+                return
+            }
+            const res = await lineregApi.rebindApply()
+            message.success(t('tunservice.rebindApplied', {n: res?.data?.applied ?? n}))
+        } catch (e: any) {
+            message.error(e?.response?.data?.message || t('common.failed'))
+        }
+    }
+
+    // 测速：对服务关联线路做一次即时并发测速，弹窗展示（延迟升序、失败标红）。
+    const runSpeedtest = async (row: any) => {
+        setSpeedtestRow(row)
+        setSpeedtestOpen(true)
+        setSpeedtestLoading(true)
+        setSpeedtestData([])
+        try {
+            const res = await tunserviceApi.speedtest(row.id)
+            setSpeedtestData(res?.data || [])
+        } catch (e: any) {
+            message.error(e?.response?.data?.message || t('common.failed'))
+        } finally {
+            setSpeedtestLoading(false)
+        }
+    }
+
     const showDetail = async (id: number) => {
         setDetailOpen(true)
         setHistory({})
@@ -157,6 +242,86 @@ const TunService: React.FC = () => {
             setHistory(historyRes?.data || {})
         } catch (e: any) {
             message.error(e?.response?.data?.message || t('common.failed'))
+        }
+    }
+
+    // 加载单线路探测历史（用于 ECharts 趋势图弹窗）
+    const loadLineTrend = async (lineId: string) => {
+        setLineTrendOpen(true)
+        setLineTrendLineId(lineId)
+        setLineTrendData([])
+        setLineTrendLoading(true)
+        try {
+            const res = await lineregApi.getLineHistory(lineId, 100)
+            setLineTrendData(res?.data || [])
+        } catch (e: any) {
+            message.error(e?.response?.data?.message || t('tunservice.lineTrendLoadFailed'))
+        } finally {
+            setLineTrendLoading(false)
+        }
+    }
+
+    // 构建 ECharts option（延迟趋势 + 可用性标记）
+    const buildTrendOption = (data: any[]) => {
+        if (!data || data.length === 0) {
+            return {
+                title: {text: t('tunservice.noHistory'), left: 'center', top: 'center', textStyle: {color: '#999'}},
+                xAxis: {type: 'category', show: false},
+                yAxis: {type: 'value', show: false},
+                series: [],
+            }
+        }
+        // 取 http_latency（有值优先）或 tcp_latency，转 ms
+        const latencies = data.map(p => {
+            const v = (p.http_latency || 0) > 0 ? p.http_latency : p.tcp_latency
+            return v > 0 ? v / 1e6 : null
+        })
+        const times = data.map(p => {
+            const d = new Date(p.created_at || p.id * 1000)
+            return d.toLocaleTimeString()
+        })
+        const maxLat = Math.max(...latencies.filter(v => v !== null) as number[], 1)
+        // 失败点：Y 轴顶端（maxLat * 1.2），成功点按实际延迟
+        const failData = data
+            .map((p, i) => (p.available === false ? {value: maxLat * 1.2, time: times[i]} : null))
+            .filter(Boolean) as any[]
+        const successData = data
+            .map((p, i) => (p.available !== false && latencies[i] !== null ? {value: latencies[i], time: times[i]} : null))
+            .filter(Boolean) as any[]
+        return {
+            tooltip: {trigger: 'axis'},
+            legend: {data: ['延迟 (ms)', '失败点'], bottom: 0},
+            grid: {left: 50, right: 20, top: 20, bottom: 40},
+            xAxis: {type: 'category', data: times, axisLabel: {rotate: 45, fontSize: 10}},
+            yAxis: {
+                type: 'value',
+                name: 'ms',
+                max: maxLat * 1.3,
+                axisLabel: {fontSize: 10},
+                splitLine: {lineStyle: {color: '#eee'}},
+            },
+            series: [
+                {
+                    name: '延迟 (ms)',
+                    type: 'line',
+                    smooth: true,
+                    data: successData.map((d: any) => d.value),
+                    itemStyle: {color: '#1677ff'},
+                    areaStyle: {
+                        color: {
+                            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+                            colorStops: [{offset: 0, color: 'rgba(22,119,255,0.25)'}, {offset: 1, color: 'rgba(22,119,255,0.03)'}],
+                        },
+                    },
+                },
+                {
+                    name: '失败点',
+                    type: 'scatter',
+                    data: failData.map((d: any) => [d.time, d.value]),
+                    itemStyle: {color: '#ff4d4f'},
+                    symbolSize: 8,
+                },
+            ],
         }
     }
 
@@ -257,6 +422,9 @@ const TunService: React.FC = () => {
                             <Button size="small" type="primary" icon={<PlayCircleOutlined/>} onClick={() => start(row.id)}/>
                         </Tooltip>
                     )}
+                    <Tooltip title={t('tunservice.speedtest')}>
+                        <Button size="small" icon={<ThunderboltOutlined/>} onClick={() => runSpeedtest(row)}/>
+                    </Tooltip>
                     <Tooltip title={t('tunservice.detail')}>
                         <Button size="small" onClick={() => showDetail(row.id)}>{t('tunservice.detail')}</Button>
                     </Tooltip>
@@ -281,6 +449,9 @@ const TunService: React.FC = () => {
                 </Button>
                 <Button icon={<ReloadOutlined/>} onClick={load}>
                     {t('common.refresh')}
+                </Button>
+                <Button icon={<SettingOutlined/>} onClick={openProbe}>
+                    {t('tunservice.probeConfig')}
                 </Button>
             </Space>
 
@@ -324,6 +495,14 @@ const TunService: React.FC = () => {
                     >
                         <Input.TextArea rows={3} placeholder='["frp:1","cftunnel:2"]'/>
                     </Form.Item>
+                    <Form.Item name="locked_line" label={t('tunservice.lockLine')}>
+                        <Select allowClear placeholder={t('tunservice.auto')}>
+                            <Option value="">{t('tunservice.auto')}</Option>
+                            {editing?.lines?.map((l: any) => (
+                                <Option key={l.id} value={l.id}>{l.name || l.id}</Option>
+                            ))}
+                        </Select>
+                    </Form.Item>
                     <Form.Item name="enable" label={t('common.enable')} valuePropName="checked">
                         <Switch/>
                     </Form.Item>
@@ -331,6 +510,91 @@ const TunService: React.FC = () => {
                         <Input.TextArea rows={2}/>
                     </Form.Item>
                 </Form>
+            </Modal>
+
+            <Modal
+                title={t('tunservice.probeConfig')}
+                open={probeOpen}
+                onOk={saveProbe}
+                onCancel={() => setProbeOpen(false)}
+                destroyOnClose
+                width={480}
+                confirmLoading={probeLoading}
+            >
+                <Form form={probeForm} layout="vertical">
+                    <Form.Item name="interval_sec" label={t('tunservice.probeInterval')} rules={[{required: true}]}>
+                        <InputNumber min={5} max={3600} style={{width: '100%'}}/>
+                    </Form.Item>
+                    <Form.Item name="failure_threshold" label={t('tunservice.failureThreshold')} rules={[{required: true}]}>
+                        <InputNumber min={1} max={10} style={{width: '100%'}}/>
+                    </Form.Item>
+                    <Form.Item name="tolerance_ms" label={t('tunservice.toleranceMs')} rules={[{required: true}]}>
+                        <InputNumber min={0} max={5000} style={{width: '100%'}}/>
+                    </Form.Item>
+                    <Form.Item name="max_concurrent" label={t('tunservice.maxConcurrent')} rules={[{required: true}]}>
+                        <InputNumber min={1} max={64} style={{width: '100%'}}/>
+                    </Form.Item>
+                    <Form.Item name="tool_filter" label={t('tunservice.toolFilter')} tooltip={t('tunservice.toolFilterTip')}>
+                        <Input placeholder="wireguard"/>
+                    </Form.Item>
+                    <Form.Item name="rebind_mode" label={t('tunservice.rebindMode')}>
+                        <Select>
+                            <Option value="auto">{t('tunservice.rebindAuto')}</Option>
+                            <Option value="manual">{t('tunservice.rebindManual')}</Option>
+                            <Option value="off">{t('tunservice.rebindOff')}</Option>
+                        </Select>
+                    </Form.Item>
+                    <Form.Item>
+                        <Button block onClick={applyPendingRebinds} icon={<ReloadOutlined/>}>
+                            {t('tunservice.rebindApply')}
+                        </Button>
+                    </Form.Item>
+                </Form>
+            </Modal>
+
+            <Modal
+                title={`${t('tunservice.speedtest')} · ${speedtestRow?.name || ''}`}
+                open={speedtestOpen}
+                onCancel={() => setSpeedtestOpen(false)}
+                footer={[
+                    <Button key="retest" icon={<ThunderboltOutlined/>} loading={speedtestLoading} onClick={() => runSpeedtest(speedtestRow)}>
+                        {t('tunservice.speedtestRetest')}
+                    </Button>,
+                    <Button key="close" type="primary" onClick={() => setSpeedtestOpen(false)}>
+                        {t('common.close')}
+                    </Button>,
+                ]}
+                destroyOnClose
+                width={520}
+            >
+                <Table
+                    rowKey="id"
+                    size="small"
+                    loading={speedtestLoading}
+                    pagination={false}
+                    dataSource={speedtestData}
+                    columns={[
+                        {title: 'ID', dataIndex: 'id', width: 120},
+                        {title: t('common.name'), dataIndex: 'name'},
+                        {
+                            title: t('tunservice.latency'),
+                            dataIndex: 'latency',
+                            width: 110,
+                            render: (v: number, row: any) => {
+                                if (row.error) {
+                                    return <Text type="danger">{t('tunservice.speedtestDown')}</Text>
+                                }
+                                return v > 0 ? <Text strong style={{color: '#faad14'}}>{`${(v / 1e6).toFixed(1)} ms`}</Text> : '-'
+                            },
+                        },
+                        {
+                            title: t('common.status'),
+                            dataIndex: 'error',
+                            width: 90,
+                            render: (v: string) => (v ? <Badge status="error" text={t('tunservice.speedtestDown')}/> : <Badge status="success" text={t('common.normal')}/>),
+                        },
+                    ]}
+                />
             </Modal>
 
             <Drawer
@@ -371,7 +635,16 @@ const TunService: React.FC = () => {
                                     {
                                         title: t('tunservice.trend'),
                                         key: 'trend',
-                                        render: (_: any, row: any) => <Sparkline points={history[row.id] || []}/>,
+                                        render: (_: any, row: any) => (
+                                            <Button
+                                                type="link"
+                                                size="small"
+                                                onClick={() => loadLineTrend(row.id)}
+                                                icon={<ReloadOutlined style={{fontSize: 11}}/>}
+                                            >
+                                                <Sparkline points={history[row.id] || []}/>
+                                            </Button>
+                                        ),
                                     },
                                     {
                                         title: t('common.status'),
@@ -385,6 +658,30 @@ const TunService: React.FC = () => {
                     </Space>
                 )}
             </Drawer>
+
+            {/* 线路延迟趋势图弹窗 */}
+            <Modal
+                title={`${t('tunservice.lineTrendTitle')} · ${lineTrendLineId}`}
+                open={lineTrendOpen}
+                onCancel={() => setLineTrendOpen(false)}
+                footer={[
+                    <Button key="close" type="primary" onClick={() => setLineTrendOpen(false)}>
+                        {t('common.close')}
+                    </Button>,
+                ]}
+                width={720}
+                destroyOnClose
+            >
+                {lineTrendLoading ? (
+                    <div style={{textAlign: 'center', padding: 40}}>{t('common.loading')}</div>
+                ) : (
+                    <ReactECharts
+                        option={buildTrendOption(lineTrendData)}
+                        style={{height: 280, width: '100%'}}
+                        notMerge={true}
+                    />
+                )}
+            </Modal>
         </div>
     )
 }

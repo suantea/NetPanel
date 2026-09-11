@@ -1,0 +1,220 @@
+// Package handlers 线路探测策略参数化（#9a）：
+// 把探测间隔 / 失败阈值 / 容差 / 并发上限四项参数持久化到 SystemConfig，
+// 并通过 linereg.Manager.LoadProbeConfig() 在启动时与更新后应用。
+package handlers
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/netpanel/netpanel/model"
+	"github.com/netpanel/netpanel/service/linereg"
+	"github.com/sirupsen/logrus"
+	"gorm.io/gorm"
+)
+
+// 探测参数在 SystemConfig 中的键名。
+const (
+	cfgKeyIntervalSec      = "probe_interval_sec"
+	cfgKeyFailureThreshold = "probe_failure_threshold"
+	cfgKeyToleranceMs      = "probe_tolerance_ms"
+	cfgKeyMaxConcurrent    = "probe_max_concurrent"
+	cfgKeyToolFilter       = "probe_tool_filter"
+	cfgKeyRebindMode       = "port_rebind_mode"
+)
+
+// 探测参数默认值（与 linereg.DefaultInterval / selector 默认一致）。
+const (
+	defaultIntervalSec      = 60
+	defaultFailureThreshold = 2
+	defaultToleranceMs      = 50
+	defaultMaxConcurrent    = 8
+)
+
+// 校验范围（含上下界）。
+const (
+	minIntervalSec      = 5
+	maxIntervalSec      = 3600
+	minFailureThreshold = 1
+	maxFailureThreshold = 10
+	minToleranceMs      = 0
+	maxToleranceMs      = 5000
+	minMaxConcurrent    = 1
+	maxMaxConcurrent    = 64
+)
+
+// LineregHandler 线路探测策略处理器。
+type LineregHandler struct {
+	db  *gorm.DB
+	log *logrus.Logger
+	mgr *linereg.Manager
+}
+
+// NewLineregHandler 创建线路探测策略处理器。
+func NewLineregHandler(db *gorm.DB, log *logrus.Logger, mgr *linereg.Manager) *LineregHandler {
+	return &LineregHandler{db: db, log: log, mgr: mgr}
+}
+
+// probeConfigResponse 前端回填用响应体。
+type probeConfigResponse struct {
+	IntervalSec      int    `json:"interval_sec"`
+	FailureThreshold int    `json:"failure_threshold"`
+	ToleranceMs      int    `json:"tolerance_ms"`
+	MaxConcurrent    int    `json:"max_concurrent"`
+	ToolFilter       string `json:"tool_filter"` // 逗号分隔的工具名；空 = 全部参与
+	RebindMode       string `json:"rebind_mode"` // auto / manual / off
+}
+
+// probeConfigRequest 前端提交的配置更新请求体。
+type probeConfigRequest struct {
+	IntervalSec      int    `json:"interval_sec"`
+	FailureThreshold int    `json:"failure_threshold"`
+	ToleranceMs      int    `json:"tolerance_ms"`
+	MaxConcurrent    int    `json:"max_concurrent"`
+	ToolFilter       string `json:"tool_filter"`
+	RebindMode       string `json:"rebind_mode"`
+}
+
+// getConfigInt 从 SystemConfig 读取一个整型参数；缺失或解析失败时返回 def。
+func getConfigInt(db *gorm.DB, key string, def int) int {
+	var cfg model.SystemConfig
+	if err := db.Where("key = ?", key).First(&cfg).Error; err != nil {
+		return def
+	}
+	v, err := strconv.Atoi(cfg.Value)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// GetConfig 读取探测策略参数（无记录返回默认值）。
+func (h *LineregHandler) GetConfig(c *gin.Context) {
+	resp := probeConfigResponse{
+		IntervalSec:      getConfigInt(h.db, cfgKeyIntervalSec, defaultIntervalSec),
+		FailureThreshold: getConfigInt(h.db, cfgKeyFailureThreshold, defaultFailureThreshold),
+		ToleranceMs:      getConfigInt(h.db, cfgKeyToleranceMs, defaultToleranceMs),
+		MaxConcurrent:    getConfigInt(h.db, cfgKeyMaxConcurrent, defaultMaxConcurrent),
+		ToolFilter:       getConfigString(h.db, cfgKeyToolFilter, ""),
+		RebindMode:       h.mgr.RebindMode(),
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "data": resp})
+}
+
+// getConfigString 从 SystemConfig 读取一个字符串参数；缺失时返回 def。
+func getConfigString(db *gorm.DB, key, def string) string {
+	var cfg model.SystemConfig
+	if err := db.Where("key = ?", key).First(&cfg).Error; err != nil {
+		return def
+	}
+	return cfg.Value
+}
+
+// setConfigUpsertString 写入（或更新）一条 SystemConfig 字符串参数。
+func setConfigUpsertString(db *gorm.DB, key, value string) {
+	var cfg model.SystemConfig
+	if err := db.Where("key = ?", key).First(&cfg).Error; err == nil {
+		cfg.Value = value
+		db.Save(&cfg)
+		return
+	}
+	db.Create(&model.SystemConfig{Key: key, Value: value})
+}
+
+// setConfigUpsert 写入（或更新）一条 SystemConfig 整型参数。
+func setConfigUpsert(db *gorm.DB, key string, value int) {
+	var cfg model.SystemConfig
+	if err := db.Where("key = ?", key).First(&cfg).Error; err == nil {
+		cfg.Value = strconv.Itoa(value)
+		db.Save(&cfg)
+		return
+	}
+	db.Create(&model.SystemConfig{Key: key, Value: strconv.Itoa(value)})
+}
+
+// validateProbeConfig 校验探测策略四项参数是否在允许范围内，返回首个越界项名。
+func validateProbeConfig(req probeConfigRequest) string {
+	if req.IntervalSec < minIntervalSec || req.IntervalSec > maxIntervalSec {
+		return "interval_sec"
+	}
+	if req.FailureThreshold < minFailureThreshold || req.FailureThreshold > maxFailureThreshold {
+		return "failure_threshold"
+	}
+	if req.ToleranceMs < minToleranceMs || req.ToleranceMs > maxToleranceMs {
+		return "tolerance_ms"
+	}
+	if req.MaxConcurrent < minMaxConcurrent || req.MaxConcurrent > maxMaxConcurrent {
+		return "max_concurrent"
+	}
+	return ""
+}
+
+// UpdateConfig 校验并写入探测策略四项参数，随后应用（透传到 selector）。
+func (h *LineregHandler) UpdateConfig(c *gin.Context) {
+	var req probeConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
+	}
+	// 范围校验
+	if field := validateProbeConfig(req); field != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": field + " out of range"})
+		return
+	}
+	// 重绑模式校验
+	switch req.RebindMode {
+	case "", linereg.RebindModeAuto, linereg.RebindModeManual, linereg.RebindModeOff:
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "rebind_mode must be auto/manual/off"})
+		return
+	}
+	// 持久化
+	setConfigUpsert(h.db, cfgKeyIntervalSec, req.IntervalSec)
+	setConfigUpsert(h.db, cfgKeyFailureThreshold, req.FailureThreshold)
+	setConfigUpsert(h.db, cfgKeyToleranceMs, req.ToleranceMs)
+	setConfigUpsert(h.db, cfgKeyMaxConcurrent, req.MaxConcurrent)
+	// 立即应用（间隔需在下一轮探测循环生效，其余透传到 selector 即时生效）
+	setConfigUpsertString(h.db, cfgKeyToolFilter, req.ToolFilter)
+	setConfigUpsertString(h.db, cfgKeyRebindMode, req.RebindMode)
+	h.mgr.SetInterval(time.Duration(req.IntervalSec) * time.Second)
+	h.mgr.SetFailureThreshold(req.FailureThreshold)
+	h.mgr.SetTolerance(time.Duration(req.ToleranceMs) * time.Millisecond)
+	h.mgr.SetMaxConcurrent(req.MaxConcurrent)
+	h.mgr.SetToolFilter(req.ToolFilter)
+	h.mgr.SetRebindMode(req.RebindMode)
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "已更新"})
+}
+
+// PendingRebinds 返回 manual 模式下待重绑的服务清单（svcID -> 目标线路）。
+func (h *LineregHandler) PendingRebinds(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"code": 200, "data": h.mgr.PendingRebinds()})
+}
+
+// ApplyRebinds 手动触发全部待重绑服务（manual 模式使用）。
+func (h *LineregHandler) ApplyRebinds(c *gin.Context) {
+	applied, err := h.mgr.ApplyPendingRebinds()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error(), "applied": applied})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "已重绑", "applied": applied})
+}
+
+// LineHistory 返回指定线路的探测历史（延迟趋势），供前端趋势图使用。
+// 路径参数 line_id，可选查询参数 limit（默认 100，上限 500）。
+func (h *LineregHandler) LineHistory(c *gin.Context) {
+	lineID := c.Param("line_id")
+	if lineID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "line_id 不能为空"})
+		return
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	history, err := h.mgr.History(lineID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "data": history})
+}

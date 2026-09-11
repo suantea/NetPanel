@@ -167,6 +167,14 @@ type Selector struct {
 	lines []Line
 	// results 最近一次测速结果（lineID -> result）。
 	results map[string]ProbeResult
+	// toolFilter 参与自动选线的工具集合（key 为 Tool 名，如 "wireguard"）。
+	// 空集合 = 全部工具参与；非空时，仅 Tool 命中的线路进入自动选线，
+	// 其余线路仍注册在 lines 中（可展示/手动锁定），但不参与自动选线。
+	toolFilter map[string]struct{}
+
+	// lineToolIdx 由 ID→Tool 组成的映射（与 lines 同步重建），
+	// 避免在 Select/bestUsable 等热点路径中对 lines 做 O(N) 扫描。
+	lineToolIdx map[string]string
 
 	// failureThreshold 连续失败多少次后线路才判为不可用（默认 1：任何一次
 	// 失败都立即视为不可用；调大可容忍瞬时抖动，避免频繁切线）。
@@ -199,6 +207,7 @@ func NewSelector(prober Prober, tolerance time.Duration) *Selector {
 		results:          make(map[string]ProbeResult),
 		failStreak:       make(map[string]int),
 		lastGood:         make(map[string]ProbeResult),
+		lineToolIdx:      make(map[string]string),
 	}
 }
 
@@ -225,12 +234,78 @@ func (s *Selector) SetFailureThreshold(n int) {
 	s.failureThreshold = n
 }
 
+// SetTolerance 设置选线防抖容差（须在首次 ProbeAll 前调用，否则不保证生效）。
+// d<=0 时重置为默认 50ms。容差越大越不敏感于延迟波动（抖动更少）。
+func (s *Selector) SetTolerance(d time.Duration) {
+	if d <= 0 {
+		d = 50 * time.Millisecond
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tolerance = d
+}
+
+// SetToolFilter 设置参与自动选线的工具集合（key 为 Tool 名）。
+// tools 为空（nil/空 slice）= 全部工具参与；非空时，仅 Tool 命中的线路
+// 参与自动选线，其余线路仍保留在 lines 中供展示与手动锁定。
+// 须在首次 ProbeAll 前调用，否则不保证生效。
+func (s *Selector) SetToolFilter(tools []string) {
+	filter := make(map[string]struct{}, len(tools))
+	for _, t := range tools {
+		if t != "" {
+			filter[t] = struct{}{}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(filter) == 0 {
+		s.toolFilter = nil
+		return
+	}
+	s.toolFilter = filter
+}
+
+// toolAllowed 判断 Tool 是否参与自动选线（过滤为空 = 全部参与）。
+func (s *Selector) toolAllowed(tool string) bool {
+	if len(s.toolFilter) == 0 {
+		return true
+	}
+	_, ok := s.toolFilter[tool]
+	return ok
+}
+
+// MaxConcurrent 返回当前单轮探测的最大并发数。
+func (s *Selector) MaxConcurrent() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxConcurrent
+}
+
+// FailureThreshold 返回当前连续失败阈值。
+func (s *Selector) FailureThreshold() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failureThreshold
+}
+
+// Tolerance 返回当前选线防抖容差。
+func (s *Selector) Tolerance() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tolerance
+}
+
 // SetLines 全量替换线路集合（保留锁线与当前选择；失效的锁线自动解除）。
 // 拷贝传入 slice，避免调用方后续修改污染内部状态。
 func (s *Selector) SetLines(lines []Line) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lines = append([]Line(nil), lines...)
+	// 同步重建 ID→Tool 映射：让 Select/bestUsable/lineTool 从 O(N) 降到 O(1)。
+	s.lineToolIdx = make(map[string]string, len(lines))
+	for _, l := range lines {
+		s.lineToolIdx[l.ID] = l.Tool
+	}
 	known := make(map[string]bool, len(lines))
 	for _, l := range lines {
 		known[l.ID] = true
@@ -261,11 +336,75 @@ func (s *Selector) Lines() []Line {
 	return append([]Line(nil), s.lines...)
 }
 
+// SetProber 替换探测器（测试注入用）。p 为 nil 时忽略。
+// 须在首次探测前调用，否则不保证生效。
+func (s *Selector) SetProber(p Prober) {
+	if p == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prober = p
+}
+
+// ProbeLines 对给定线路做一次即时并发测速，不刷新内部选线状态
+// （current/锁线/探测历史均不受影响）。用于「用户手动测速」等一次性场景。
+// 复用与 ProbeAll 相同的信号量限流；返回 lineID -> ProbeResult。
+func (s *Selector) ProbeLines(ctx context.Context, lines []Line) map[string]ProbeResult {
+	if len(lines) == 0 {
+		return map[string]ProbeResult{}
+	}
+	maxConcurrent := s.maxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 8
+	}
+	s.mu.Lock()
+	prober := s.prober
+	s.mu.Unlock()
+
+	sem := make(chan struct{}, maxConcurrent)
+	results := make(map[string]ProbeResult, len(lines))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, line := range lines {
+		wg.Add(1)
+		go func(l Line) {
+			defer wg.Done()
+			// ctx 已取消时确定性返回「probe canceled」，而非与 sem 发送竞态：
+			// select 在两条通道均就绪时随机选择，可能跳过取消分支继续探测。
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				results[l.ID] = ProbeResult{LineID: l.ID, Err: &ProbeError{Reason: "probe canceled"}}
+				mu.Unlock()
+				return
+			default:
+			}
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				mu.Lock()
+				results[l.ID] = ProbeResult{LineID: l.ID, Err: &ProbeError{Reason: "probe canceled"}}
+				mu.Unlock()
+				return
+			}
+			r := prober.Probe(ctx, l)
+			mu.Lock()
+			results[l.ID] = r
+			mu.Unlock()
+		}(line)
+	}
+	wg.Wait()
+	return results
+}
+
 // ProbeAll 并发探测全部线路并刷新结果，返回按线路 id 索引的结果。
 // 并发数受 maxConcurrent 信号量限制，线路过多时不会同时打爆对端/本机连接。
 func (s *Selector) ProbeAll(ctx context.Context) map[string]ProbeResult {
 	s.mu.Lock()
 	lines := append([]Line(nil), s.lines...)
+	prober := s.prober
 	maxConcurrent := s.maxConcurrent
 	s.mu.Unlock()
 
@@ -291,7 +430,7 @@ func (s *Selector) ProbeAll(ctx context.Context) map[string]ProbeResult {
 				mu.Unlock()
 				return
 			}
-			r := s.prober.Probe(ctx, l)
+			r := prober.Probe(ctx, l)
 			mu.Lock()
 			results[l.ID] = r
 			mu.Unlock()
@@ -383,7 +522,9 @@ func (s *Selector) Select() Selection {
 
 	// 防抖：当前线路仍可用，且不比最优慢超过 tolerance 时保持现状；
 	// 只有当当前线路比最优慢得更多（或更慢）才切换，避免频繁抖动。
-	if s.current != "" {
+	// 若当前线路的工具已不在自动选线过滤内（如用户临时切换过滤配置），
+	// 不做防抖，直接切换到允许工具中的最优线路。
+	if s.current != "" && s.toolAllowed(s.lineTool(s.current)) {
 		cur, curOK := s.results[s.current]
 		bestR, bestOK := s.results[best]
 		if curOK && bestOK && s.usable(cur) && s.latencyFor(cur)-s.latencyFor(bestR) <= s.tolerance {
@@ -396,24 +537,33 @@ func (s *Selector) Select() Selection {
 
 // bestUsable 返回可用线路中延迟最小的一条；无可用时返回空串。
 // 排序键为 effectiveLatency：配置了 ProbeURL 时优先按 HTTP 出网延迟，
-// 否则按 TCP 握手延迟。
+// 否则按 TCP 握手延迟。仅考虑 toolFilter 允许的工具线路。
 func (s *Selector) bestUsable() string {
 	type cand struct {
 		id  string
 		lat time.Duration
 	}
 	var cands []cand
-	for id, r := range s.results {
-		if !s.usable(r) {
+	for _, l := range s.lines {
+		if !s.toolAllowed(l.Tool) {
 			continue
 		}
-		cands = append(cands, cand{id: id, lat: s.latencyFor(r)})
+		r, ok := s.results[l.ID]
+		if !ok || !s.usable(r) {
+			continue
+		}
+		cands = append(cands, cand{id: l.ID, lat: s.latencyFor(r)})
 	}
 	if len(cands) == 0 {
 		return ""
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].lat < cands[j].lat })
 	return cands[0].id
+}
+
+// lineTool 返回线路 id 对应的工具名（不存在时返回空串）。
+func (s *Selector) lineTool(id string) string {
+	return s.lineToolIdx[id]
 }
 
 // Lock 手动锁定某条线路（必须存在于当前线路集合中，否则忽略）。

@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // DNSProvider DNS 服务商接口
@@ -31,6 +33,8 @@ type DNSProvider interface {
 	// domain: 完整域名（如 _acme-challenge.example.com）
 	// recordType: 记录类型（如 TXT）
 	DeleteRecord(domain, recordType string) error
+	// VerifyCredentials 验证服务商凭据是否有效（只读查询，不产生任何变更）
+	VerifyCredentials() error
 }
 
 // NewProvider 创建 DNS 服务商实例
@@ -49,10 +53,42 @@ func NewProvider(name, accessID, accessSecret string) DNSProvider {
 	}
 }
 
-// splitDomain 将完整域名拆分为主机记录和根域名
-// 例如 home.example.com -> ("home", "example.com")
-// 例如 example.com -> ("@", "example.com")
+// splitDomain 将完整域名拆分为主机记录和根域名。
+//
+// 使用公共后缀列表（Public Suffix List）识别根域名，可正确处理 eu.org、
+// co.uk、com.cn 等多段后缀；同时支持手动指定语法 "主机记录:根域名"，
+// 用于私有或特殊后缀（与 ddns-go 一致）。
+//
+// 例如 home.example.com  -> ("home", "example.com")
+// 例如 xxx.yyy.eu.org    -> ("xxx", "yyy.eu.org")
+// 例如 example.com       -> ("@", "example.com")
 func splitDomain(fullDomain string) (rr, domain string) {
+	fullDomain = strings.TrimSpace(fullDomain)
+	fullDomain = strings.TrimSuffix(fullDomain, ".")
+
+	// 手动指定语法：主机记录:根域名（如 "home:yyy.eu.org"）
+	if idx := strings.Index(fullDomain, ":"); idx > 0 {
+		sub := fullDomain[:idx]
+		root := strings.TrimSpace(fullDomain[idx+1:])
+		if sub == "" {
+			sub = "@"
+		}
+		if root == "" {
+			return "@", fullDomain
+		}
+		return sub, root
+	}
+
+	// 使用公共后缀列表识别可注册域名（eTLD+1）
+	if eTLD1, err := publicsuffix.EffectiveTLDPlusOne(fullDomain); err == nil && eTLD1 != "" {
+		if eTLD1 == fullDomain {
+			return "@", fullDomain
+		}
+		sub := strings.TrimSuffix(fullDomain, "."+eTLD1)
+		return sub, eTLD1
+	}
+
+	// 回退：按最后两段切分（兼容无法识别的后缀）
 	parts := strings.Split(fullDomain, ".")
 	if len(parts) <= 2 {
 		return "@", fullDomain
@@ -277,6 +313,31 @@ func (p *AliDNSProvider) DeleteRecord(domain, recordType string) error {
 	return nil
 }
 
+// VerifyCredentials 验证阿里云 DNS 凭据（只读查询 DescribeDomains）
+func (p *AliDNSProvider) VerifyCredentials() error {
+	if p.AccessKeyID == "" || p.AccessKeySecret == "" {
+		return fmt.Errorf("阿里云 DNS 凭据不完整：AccessKey ID 和 AccessKey Secret 均为必填")
+	}
+	body, err := p.aliRequest("DescribeDomains", map[string]string{
+		"PageNumber": "1",
+		"PageSize":   "1",
+	})
+	if err != nil {
+		return fmt.Errorf("验证阿里云 DNS 凭据失败: %w", err)
+	}
+	var result struct {
+		Code    string `json:"Code"`
+		Message string `json:"Message"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("解析阿里云 DNS 响应失败: %w", err)
+	}
+	if result.Code != "" {
+		return fmt.Errorf("阿里云 DNS 凭据无效: %s", result.Message)
+	}
+	return nil
+}
+
 // ===== Cloudflare =====
 
 // CloudflareProvider Cloudflare DNS 服务商
@@ -419,6 +480,33 @@ func (p *CloudflareProvider) DeleteRecord(domain, recordType string) error {
 		if err != nil {
 			return fmt.Errorf("删除 Cloudflare DNS 记录失败: %w", err)
 		}
+	}
+	return nil
+}
+
+// VerifyCredentials 验证 Cloudflare 凭据（GET /user/tokens/verify）
+func (p *CloudflareProvider) VerifyCredentials() error {
+	if p.APIToken == "" {
+		return fmt.Errorf("Cloudflare 凭据不完整：API Token 为必填")
+	}
+	body, err := httpGet(cfAPIBase+"/user/tokens/verify", p.cfHeaders())
+	if err != nil {
+		return fmt.Errorf("验证 Cloudflare 凭据失败: %w", err)
+	}
+	var result struct {
+		Success bool `json:"success"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("解析 Cloudflare 响应失败: %w", err)
+	}
+	if !result.Success {
+		if len(result.Errors) > 0 {
+			return fmt.Errorf("Cloudflare 凭据无效: %s", result.Errors[0].Message)
+		}
+		return fmt.Errorf("Cloudflare 凭据无效")
 	}
 	return nil
 }
@@ -638,6 +726,34 @@ func (p *DnspodProvider) DeleteRecord(domain, recordType string) error {
 	return nil
 }
 
+// VerifyCredentials 验证 DNSPod 凭据（只读查询 DescribeDomainList）
+func (p *DnspodProvider) VerifyCredentials() error {
+	if p.SecretID == "" || p.SecretKey == "" {
+		return fmt.Errorf("DNSPod 凭据不完整：Secret ID 和 Secret Key 均为必填")
+	}
+	body, err := p.dnspodRequest("DescribeDomainList", map[string]interface{}{
+		"Limit":  1,
+		"Offset": 0,
+	})
+	if err != nil {
+		return fmt.Errorf("验证 DNSPod 凭据失败: %w", err)
+	}
+	var result struct {
+		Response struct {
+			Error *struct {
+				Message string `json:"Message"`
+			} `json:"Error"`
+		} `json:"Response"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("解析 DNSPod 响应失败: %w", err)
+	}
+	if result.Response.Error != nil {
+		return fmt.Errorf("DNSPod 凭据无效: %s", result.Response.Error.Message)
+	}
+	return nil
+}
+
 // ===== Webhook =====
 
 // WebhookProvider Webhook 服务商
@@ -700,6 +816,11 @@ func (p *WebhookProvider) UpdateRecord(domain, recordType, ip, ttl string) error
 func (p *WebhookProvider) DeleteRecord(domain, recordType string) error {
 	// Webhook 不支持删除操作，忽略
 	return nil
+}
+
+// VerifyCredentials Webhook 不支持凭据验证
+func (p *WebhookProvider) VerifyCredentials() error {
+	return fmt.Errorf("Webhook 类型不支持凭据验证")
 }
 
 // ===== MD5 工具（备用）=====

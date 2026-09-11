@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/netpanel/netpanel/api/middleware"
 	"github.com/netpanel/netpanel/model"
 	"github.com/netpanel/netpanel/pkg/utils"
 	"github.com/netpanel/netpanel/service/syslog"
@@ -185,13 +186,17 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 // UpdateUser 更新用户信息
 // PUT /api/v1/admin/users/:id
 func (h *UserHandler) UpdateUser(c *gin.Context) {
-	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
 
-	// 获取当前操作者
-	currentUser, _ := c.Get("username")
-	currentUsername, _ := currentUser.(string)
+	// 当前操作者身份取自令牌：以用户 ID 为稳定标识
+	// （用户名可被修改，不能作为身份判断依据）
+	currentUserID, _ := middleware.CurrentUserID(c)
 
 	var req struct {
+		Username string `json:"username"` // 为空则不修改（支持改名）
 		Password string `json:"password"` // 为空则不修改
 		Email    string `json:"email"`
 		Enable   *bool  `json:"enable"`
@@ -209,21 +214,42 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 		return
 	}
 
-	// admin 用户不允许修改 is_admin 字段（防止自我降权）
-	if user.Username == "admin" && req.IsAdmin != nil && !*req.IsAdmin {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "admin 用户不允许取消管理员权限"})
-		return
-	}
-
-	// 非 admin 操作者不能修改 is_admin
-	if currentUsername != "admin" && req.IsAdmin != nil {
-		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "只有 admin 可以修改管理员权限"})
-		return
-	}
-
 	updates := map[string]interface{}{
 		"email":  req.Email,
 		"remark": req.Remark,
+	}
+
+	// 改名：内置 admin 不允许改名；新用户名需唯一
+	if req.Username != "" && req.Username != user.Username {
+		if len(req.Username) < 2 || len(req.Username) > 50 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "用户名长度需在 2-50 之间"})
+			return
+		}
+		if user.Username == "admin" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "内置 admin 账号不允许改名"})
+			return
+		}
+		var dup int64
+		h.db.Model(&model.User{}).Where("username = ? AND id <> ?", req.Username, user.ID).Count(&dup)
+		if dup > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "用户名已存在"})
+			return
+		}
+		updates["username"] = req.Username
+	}
+
+	// 当前操作者不能取消自己的管理员权限（防止误操作后无人可管理）。
+	// 按用户 ID 比较：本接口支持改名，用户名已不是稳定标识。
+	if currentUserID != 0 && currentUserID == user.ID && req.IsAdmin != nil && !*req.IsAdmin {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "不能取消自己的管理员权限"})
+		return
+	}
+
+	// 修改管理员权限需要管理员身份。
+	// 路由层 AdminOnly 已做拦截，此处为纵深防御（防止后续路由调整时失守）。
+	if req.IsAdmin != nil && !middleware.IsCurrentUserAdmin(c) {
+		c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "只有管理员可以修改管理员权限"})
+		return
 	}
 	if req.Enable != nil {
 		// admin 用户不允许被禁用
@@ -266,7 +292,10 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 // DeleteUser 删除用户
 // DELETE /api/v1/admin/users/:id
 func (h *UserHandler) DeleteUser(c *gin.Context) {
-	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
 
 	var user model.User
 	if err := h.db.First(&user, id).Error; err != nil {
@@ -277,8 +306,26 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "admin 用户不允许删除"})
 		return
 	}
+	// 不允许删除自己，避免管理员误操作后失去管理入口
+	if curID, ok := middleware.CurrentUserID(c); ok && curID == user.ID {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "不能删除当前登录的账号"})
+		return
+	}
 
-	h.db.Delete(&model.User{}, id)
+	// 最后一名启用管理员不允许删除
+	if user.IsAdmin && user.Enable {
+		var adminCount int64
+		h.db.Model(&model.User{}).Where("is_admin = ? AND enable = ?", true, true).Count(&adminCount)
+		if adminCount <= 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "系统必须保留至少一名启用的管理员，不能删除最后一名管理员"})
+			return
+		}
+	}
+
+	if err := h.db.Delete(&model.User{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "删除失败: " + err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "删除成功"})
 }
 
