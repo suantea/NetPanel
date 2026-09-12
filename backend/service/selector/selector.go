@@ -38,6 +38,10 @@ type Line struct {
 	// ProbeURL 可选。非空时额外做一次 HTTP 204 探测（用于区分「能连上」与
 	// 「能正常出网」）。
 	ProbeURL string
+	// P2PScore P2P 打洞可行性评分（0-100）；仅 easytier 线路等有意义，
+	// 其他工具留 0（视为未知，不影响排序）。分数高者优先——当两条线路延迟相近时，
+	// 优先选 P2P 直连可达的线路，避免走中继造成额外延迟。
+	P2PScore int
 }
 
 // ProbeResult 单条线路的一次测速结果。
@@ -290,6 +294,20 @@ func (s *Selector) Tolerance() time.Duration {
 	return s.tolerance
 }
 
+// FailureStats 返回当前线路的失败统计（供自适应间隔使用）。
+// 返回 (总线路数, 连续失败达到阈值的线路数)。
+func (s *Selector) FailureStats() (total int, failed int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total = len(s.lines)
+	for _, line := range s.lines {
+		if s.failStreak[line.ID] >= s.failureThreshold {
+			failed++
+		}
+	}
+	return total, failed
+}
+
 // SetLines 全量替换线路集合（保留锁线与当前选择；失效的锁线自动解除）。
 // 拷贝传入 slice，避免调用方后续修改污染内部状态。
 func (s *Selector) SetLines(lines []Line) {
@@ -527,10 +545,12 @@ func (s *Selector) Select() Selection {
 // bestUsable 返回可用线路中延迟最小的一条；无可用时返回空串。
 // 排序键为 effectiveLatency：配置了 ProbeURL 时优先按 HTTP 出网延迟，
 // 否则按 TCP 握手延迟。仅考虑 toolFilter 允许的工具线路。
+// P2PScore>0 的线路在延迟相近时优先（避免走中继增加额外延迟）。
 func (s *Selector) bestUsable() string {
 	type cand struct {
-		id  string
-		lat time.Duration
+		id       string
+		lat      time.Duration
+		p2pScore int
 	}
 	var cands []cand
 	for _, l := range s.lines {
@@ -541,12 +561,22 @@ func (s *Selector) bestUsable() string {
 		if !ok || !s.usable(r) {
 			continue
 		}
-		cands = append(cands, cand{id: l.ID, lat: s.latencyFor(r)})
+		cands = append(cands, cand{
+			id:       l.ID,
+			lat:      s.latencyFor(r),
+			p2pScore: l.P2PScore,
+		})
 	}
 	if len(cands) == 0 {
 		return ""
 	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i].lat < cands[j].lat })
+	// 先按延迟升序，延迟相同时按 P2PScore 降序（P2P 直连优先）
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].lat != cands[j].lat {
+			return cands[i].lat < cands[j].lat
+		}
+		return cands[i].p2pScore > cands[j].p2pScore
+	})
 	return cands[0].id
 }
 

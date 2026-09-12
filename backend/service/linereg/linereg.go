@@ -47,6 +47,16 @@ const (
 	// minIntervalSec 探测间隔下限：过小的间隔会造成无意义的探测压力，
 	// 且 0/负数会使 time.NewTimer 直接 panic
 	minIntervalSec = 5
+	// adaptiveIntervalEnabled 是否启用自适应间隔（失败时加快探测，稳定时放缓）
+	adaptiveIntervalEnabled = true
+	// adaptiveFastInterval 失败率过高时的快速探测间隔（秒）
+	adaptiveFastIntervalSec = 15
+	// adaptiveSlowInterval 失败率过低时的慢速探测间隔（秒）
+	adaptiveSlowIntervalSec = 120
+	// adaptiveFailureRatio 触发快速探测的失败率阈值
+	adaptiveFailureRatioFast = 0.5
+	// adaptiveFailureRatioSlow 触发慢速探测的失败率阈值
+	adaptiveFailureRatioSlow = 0.2
 )
 
 // Manager 线路注册中心：持有 selector，负责周期刷新线路并驱动测速选线。
@@ -375,12 +385,36 @@ func (m *Manager) run(ctx context.Context) {
 				default:
 				}
 			}
-			timer.Reset(m.currentInterval())
+			timer.Reset(m.adaptiveInterval())
 		case <-timer.C:
 			m.refresh(ctx)
-			timer.Reset(m.currentInterval())
+			timer.Reset(m.adaptiveInterval())
 		}
 	}
+}
+
+// adaptiveInterval 根据当前失败率动态计算探测间隔：
+// - 失败率 > 50% 时快速探测（15s）
+// - 失败率 < 20% 时慢速探测（120s）
+// - 否则使用用户配置的间隔
+func (m *Manager) adaptiveInterval() time.Duration {
+	if !adaptiveIntervalEnabled {
+		return m.currentInterval()
+	}
+	total, failed := m.selector.FailureStats()
+	if total == 0 {
+		return m.currentInterval()
+	}
+	ratio := float64(failed) / float64(total)
+	if ratio >= adaptiveFailureRatioFast {
+		m.log.Debugf("[线路选择] 失败率 %d%% 过高，切换到快速探测 (%ds)", int(ratio*100), adaptiveFastIntervalSec)
+		return time.Duration(adaptiveFastIntervalSec) * time.Second
+	}
+	if ratio <= adaptiveFailureRatioSlow {
+		m.log.Debugf("[线路选择] 失败率 %d%% 较低，切换到慢速探测 (%ds)", int(ratio*100), adaptiveSlowIntervalSec)
+		return time.Duration(adaptiveSlowIntervalSec) * time.Second
+	}
+	return m.currentInterval()
 }
 
 // refresh 从数据库重建线路集合，刷新 selector 并执行一轮测速选线。
@@ -713,19 +747,30 @@ func BuildLines(db *gorm.DB) []selector.Line {
 	}
 
 	// ---- easytier 客户端（ServerAddr 可含多个入口，逗号分隔）----
+	// P2PScore 启发式：根据 EasytierClient 的 P2P 配置估算打洞可行性
+	// - p2p_only=true → 强制 P2P，score=100
+	// - disable_p2p=true → 禁用 P2P，score=0
+	// - 其他 → 默认 P2P 可用，score=50
 	var ets []model.EasytierClient
 	if err := db.Where("enable = ?", true).Find(&ets).Error; err == nil {
 		for _, c := range ets {
+			p2pScore := 50 // 默认：P2P 可用
+			if c.P2POnly {
+				p2pScore = 100
+			} else if c.DisableP2P {
+				p2pScore = 0
+			}
 			for i, raw := range strings.Split(c.ServerAddr, ",") {
 				host := stripScheme(strings.TrimSpace(raw))
 				if host == "" {
 					continue
 				}
 				lines = append(lines, selector.Line{
-					ID:      fmt.Sprintf("easytier:%d:%d", c.ID, i),
-					Name:    c.Name,
-					Tool:    "easytier",
-					Address: host,
+					ID:       fmt.Sprintf("easytier:%d:%d", c.ID, i),
+					Name:     c.Name,
+					Tool:     "easytier",
+					Address:  host,
+					P2PScore: p2pScore,
 				})
 			}
 		}
