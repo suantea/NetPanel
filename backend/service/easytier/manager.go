@@ -104,6 +104,11 @@ type Manager struct {
 	servers  sync.Map // map[uint]*processEntry
 	stopping bool     // 标记是否正在关闭，关闭期间禁止自动重启
 	mu       sync.Mutex
+
+	// maxConcurrentStart 并发启动上限（防止大量节点同时启动耗尽资源）
+	maxConcurrentStart int
+	// startSem 启动信号量
+	startSem chan struct{}
 }
 
 // isWinPcapPanic 检测 stderr 输出中是否包含 WinPcap/Npcap 接口枚举失败的 panic 信息
@@ -122,7 +127,22 @@ func NewManager(db *gorm.DB, log *logrus.Logger, dataDir string) *Manager {
 	if absDir, err := filepath.Abs(dataDir); err == nil {
 		dataDir = absDir
 	}
-	return &Manager{db: db, log: log, dataDir: dataDir}
+	return &Manager{
+		db:                 db,
+		log:                log,
+		dataDir:            dataDir,
+		maxConcurrentStart: 4, // 默认最多同时启动 4 个实例
+		startSem:           make(chan struct{}, 4),
+	}
+}
+
+// SetMaxConcurrentStart 设置并发启动上限（0 表示不限）。
+func (m *Manager) SetMaxConcurrentStart(n int) {
+	if n <= 0 {
+		n = 100 // 近乎无限制
+	}
+	m.maxConcurrentStart = n
+	m.startSem = make(chan struct{}, n)
 }
 
 // getBinaryPath 获取 easytier-core 二进制路径
@@ -146,7 +166,9 @@ func (m *Manager) StartAll() {
 		m.db.Where("enable = ?", true).Find(&clients)
 		for _, c := range clients {
 			c := c
+			m.startSem <- struct{}{}
 			go func() {
+				defer func() { <-m.startSem }()
 				if err := m.StartClient(c.ID); err != nil {
 					m.log.Errorf("EasyTier 客户端 [%s] 启动失败: %v", c.Name, err)
 				}
@@ -157,7 +179,9 @@ func (m *Manager) StartAll() {
 		m.db.Where("enable = ?", true).Find(&servers)
 		for _, s := range servers {
 			s := s
+			m.startSem <- struct{}{}
 			go func() {
+				defer func() { <-m.startSem }()
 				if err := m.StartServer(s.ID); err != nil {
 					m.log.Errorf("EasyTier 服务端 [%s] 启动失败: %v", s.Name, err)
 				}
