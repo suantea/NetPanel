@@ -1,6 +1,7 @@
 package cert
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -70,10 +71,19 @@ type Manager struct {
 	log     *logrus.Logger
 	dataDir string
 	mu      sync.Mutex
+	// ctx/stop 控制定时循环的生命周期（此前为裸 for-range，进程内无法优雅关闭）
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewManager(db *gorm.DB, log *logrus.Logger, dataDir string) *Manager {
-	return &Manager{db: db, log: log, dataDir: dataDir}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Manager{db: db, log: log, dataDir: dataDir, ctx: ctx, cancel: cancel}
+}
+
+// Stop 停止后台定时循环（优雅关闭时调用）
+func (m *Manager) Stop() {
+	m.cancel()
 }
 
 // StartAll 启动自动续期检查和 ACME 流程定时器
@@ -90,8 +100,13 @@ func (m *Manager) autoRenewLoop() {
 	// 启动时先检查一次
 	m.checkAndRenew()
 
-	for range ticker.C {
-		m.checkAndRenew()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.checkAndRenew()
+		}
 	}
 }
 
@@ -103,8 +118,13 @@ func (m *Manager) acmeFlowLoop() {
 	// 启动时先检查一次
 	m.processAcmeFlowTasks()
 
-	for range ticker.C {
-		m.processAcmeFlowTasks()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.processAcmeFlowTasks()
+		}
 	}
 }
 
