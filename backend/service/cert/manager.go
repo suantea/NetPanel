@@ -27,6 +27,7 @@ import (
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 	"github.com/netpanel/netpanel/model"
+	"github.com/netpanel/netpanel/pkg/svcutil"
 	"github.com/netpanel/netpanel/service/ddns"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -78,8 +79,8 @@ func NewManager(db *gorm.DB, log *logrus.Logger, dataDir string) *Manager {
 
 // StartAll 启动自动续期检查和 ACME 流程定时器
 func (m *Manager) StartAll() {
-	go m.autoRenewLoop()
-	go m.acmeFlowLoop()
+	svcutil.SafeGo(m.log, "cert.autorenew", true, m.autoRenewLoop)
+	svcutil.SafeGo(m.log, "cert.acmeflow", true, m.acmeFlowLoop)
 }
 
 // autoRenewLoop 每 12 小时检查一次证书到期情况
