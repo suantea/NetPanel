@@ -40,6 +40,7 @@ import (
 	"github.com/netpanel/netpanel/service/monitor"
 	"github.com/netpanel/netpanel/service/nps"
 	"github.com/netpanel/netpanel/service/portforward"
+	"github.com/netpanel/netpanel/service/retention"
 	"github.com/netpanel/netpanel/service/storage"
 	"github.com/netpanel/netpanel/service/stun"
 	"github.com/netpanel/netpanel/service/syslog"
@@ -289,7 +290,11 @@ func startServer() *http.Server {
 	meshNodeMgr.Start()
 	aiMgr.Start()
 	lineregMgr.Start()
-	
+
+	// 数据保留清理器：定时分批清理时序数据，防止数据库无限膨胀
+	retentionCleaner := retention.New(db, log)
+	retentionStop := retentionCleaner.Start()
+
 	// 启动监控服务
 	if err := monitorMgr.Start(); err != nil {
 		log.Errorf("监控服务启动失败: %v", err)
@@ -380,6 +385,10 @@ func startServer() *http.Server {
 	// 注册停止回调（用于 service 模式的优雅关闭）
 	registerStopHandlers(log, portforwardMgr, stunMgr, frpMgr, npsMgr,
 		easytierMgr, ddnsMgr, caddyMgr, cronMgr, storageMgr, dnsmasqMgr, callbackMgr, wireguardMgr, meshNodeMgr, lineregMgr, cftunnelMgr, monitorMgr, mcpSrv)
+	// 把清理器的停止函数链入全局优雅关闭
+	if prev := stopAllFn; prev != nil {
+		stopAllFn = func() { prev(); retentionStop() }
+	}
 
 	return srv
 }
