@@ -21,5 +21,14 @@ export default defineConfig({
   build: {
     outDir: '../backend/embed/dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        // 稳定的第三方库单独拆包：业务代码更新时 vendor chunk 命中浏览器缓存
+        manualChunks: {
+          vendor: ['react', 'react-dom', 'react-router-dom'],
+          antd: ['antd', '@ant-design/icons'],
+        },
+      },
+    },
   },
 })
