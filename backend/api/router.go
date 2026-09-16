@@ -101,6 +101,7 @@ func NewRouter(opts RouterOptions) *gin.Engine {
 	auth.GET("/system/config", sysHandler.GetConfig)
 	auth.PUT("/system/config", sysHandler.UpdateConfig)
 	auth.GET("/system/interfaces", sysHandler.GetInterfaces)
+	auth.GET("/system/health", sysHandler.GetHealth)
 	auth.POST("/system/change-password", sysHandler.ChangePassword)
 
 	// 端口转发（路径与前端保持一致）
