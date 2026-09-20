@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Button, Input, List, Modal, Select, Popconfirm, message, Empty, Spin, Upload, Typography, Tooltip } from 'antd'
 import { PlusOutlined, DeleteOutlined, EditOutlined, ExportOutlined, ImportOutlined, SendOutlined, MenuOutlined, RobotOutlined, UserOutlined, DownOutlined } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
@@ -50,6 +51,7 @@ const AiChat: React.FC = () => {
   const abortRef = useRef<AbortController | null>(null)
   const skipFetchRef = useRef(false)
   const isDraft = !activeConv
+  const navigate = useNavigate()
 
   const fetchConversations = async () => {
     try { const res: any = await aiChatApi.listConversations(); setConversations(res.data || []) } catch {}
@@ -456,6 +458,16 @@ const AiChat: React.FC = () => {
                 <div style={{ fontSize: 14, color: '#6B7280', lineHeight: 1.6 }}>
                   {t('ai.typeMessage')}
                 </div>
+                {providers.filter((p: any) => p.is_active).length === 0 && (
+                  <div style={{ marginTop: 20 }}>
+                    <div style={{ fontSize: 13, color: '#9CA3AF', marginBottom: 12 }}>
+                      尚未配置 AI Provider，请先到「AI 设置」添加并启用一个 Provider 后即可对话
+                    </div>
+                    <Button type="primary" onClick={() => navigate('/ai/provider')}>
+                      前往配置 AI Provider
+                    </Button>
+                  </div>
+                )}
               </div>
             </div>
           ) : (

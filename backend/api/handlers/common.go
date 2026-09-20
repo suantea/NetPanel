@@ -3,8 +3,10 @@
 package handlers
 
 import (
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,4 +27,34 @@ func parseUintParam(c *gin.Context, name string) (uint, bool) {
 		return 0, false
 	}
 	return uint(v), true
+}
+
+// validatePort 校验端口号范围（1-65535），非法时写入 400 响应并返回 false。
+func validatePort(c *gin.Context, field string, port int) bool {
+	if port < 1 || port > 65535 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": field + " 端口非法（须为 1-65535）: " + strconv.Itoa(port),
+		})
+		return false
+	}
+	return true
+}
+
+// validateHost 校验目标地址为合法 IP 或域名，非法时写入 400 响应并返回 false。
+func validateHost(c *gin.Context, field, host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": field + " 不能为空"})
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	// 域名：允许字母数字、点、连字符，不接受空白与协议前缀
+	if len(host) > 255 || strings.ContainsAny(host, " \t\r\n/") {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": field + " 格式非法: " + host})
+		return false
+	}
+	return true
 }

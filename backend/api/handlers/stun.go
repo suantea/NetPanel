@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/netpanel/netpanel/model"
@@ -46,6 +47,29 @@ func (h *StunHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
+	if strings.TrimSpace(rule.Name) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "规则名称不能为空"})
+		return
+	}
+	switch rule.ForwardMode {
+	case "proxy":
+		if !validatePort(c, "本地监听端口", rule.ListenPort) {
+			return
+		}
+		if !validateHost(c, "转发目标地址", rule.TargetAddress) {
+			return
+		}
+		if !validatePort(c, "转发目标端口", rule.TargetPort) {
+			return
+		}
+	case "direct":
+		if !validatePort(c, "转发目标端口", rule.TargetPort) {
+			return
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "转发模式非法（须为 proxy/direct）: " + rule.ForwardMode})
+		return
+	}
 	rule.Status = "stopped"
 	h.db.Create(&rule)
 	if rule.Enable {
@@ -56,17 +80,37 @@ func (h *StunHandler) Create(c *gin.Context) {
 }
 
 func (h *StunHandler) Update(c *gin.Context) {
-	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
 	var req model.StunRule
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
-	h.mgr.Stop(uint(id))
-	req.ID = uint(id)
+	if strings.TrimSpace(req.Name) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "规则名称不能为空"})
+		return
+	}
+	switch req.ForwardMode {
+	case "proxy":
+		if !validatePort(c, "本地监听端口", req.ListenPort) || !validateHost(c, "转发目标地址", req.TargetAddress) || !validatePort(c, "转发目标端口", req.TargetPort) {
+			return
+		}
+	case "direct":
+		if !validatePort(c, "转发目标端口", req.TargetPort) {
+			return
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "转发模式非法（须为 proxy/direct）: " + req.ForwardMode})
+		return
+	}
+	h.mgr.Stop(id)
+	req.ID = id
 	h.db.Save(&req)
 	if req.Enable {
-		h.mgr.Start(uint(id))
+		h.mgr.Start(id)
 	}
 	logger.WriteLog("info", "stun", fmt.Sprintf("修改STUN穿透规则 [%d]", id))
 	c.JSON(http.StatusOK, gin.H{"code": 200, "data": req, "message": "更新成功"})

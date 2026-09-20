@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,6 +87,16 @@ func (h *FrpcHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
+	if strings.TrimSpace(cfg.Name) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "客户端名称不能为空"})
+		return
+	}
+	if !validateHost(c, "服务器地址", cfg.ServerAddr) {
+		return
+	}
+	if !validatePort(c, "服务器端口", cfg.ServerPort) {
+		return
+	}
 	cfg.Status = "stopped"
 	h.db.Create(&cfg)
 	logger.WriteLog("info", "frp", fmt.Sprintf("创建FRP客户端 [%d] %s", cfg.ID, cfg.Name))
@@ -100,6 +111,16 @@ func (h *FrpcHandler) Update(c *gin.Context) {
 	var req model.FrpcConfig
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "客户端名称不能为空"})
+		return
+	}
+	if !validateHost(c, "服务器地址", req.ServerAddr) {
+		return
+	}
+	if !validatePort(c, "服务器端口", req.ServerPort) {
 		return
 	}
 	h.mgr.StopClient(uint(id))

@@ -1,5 +1,6 @@
 import React, {useEffect, useState} from 'react'
 import {
+    Alert,
     AutoComplete,
     Button,
     Card,
@@ -307,6 +308,18 @@ const STUN_SERVER_LIST = [
 
 const STUN_SERVER_OPTIONS = STUN_SERVER_LIST.map(v => ({value: v, label: v}))
 
+// NAT 类型不利时的引导文案；对穿透友好（FullCone/受限锥形等）的类型返回 undefined 不提示
+const natGuidance = (natType: string): string | undefined => {
+    const t = natType.toLowerCase()
+    if (t.includes('symmetric') || t.includes('对称')) {
+        return '当前为对称型 NAT（Symmetric），STUN 穿透成功率低。建议改用 FRP（有服务器时）或 Cloudflare Tunnel（无公网 IP 时）。'
+    }
+    if (t.includes('failed') || t.includes('error') || t.includes('检测失败')) {
+        return 'NAT 类型检测失败，可尝试在「高级选项」中勾选「禁用有效性检测」后重试。'
+    }
+    return undefined
+}
+
 // 分组标题（与 EasyTier 保持一致）
 const SectionTitle = ({children}: { children: React.ReactNode }) => (
     <div style={{display: 'flex', alignItems: 'center', gap: 8, margin: '12px 0 8px'}}>
@@ -606,12 +619,17 @@ const Stun: React.FC = () => {
                         name="target_address"
                         label={t('stun.targetAddress')}
                         extra={<span style={{fontSize: 11}}>穿透成功后将流量转发到此地址</span>}
+                        rules={[{required: true, message: '请填写目标 IP 或域名'}]}
                     >
                         <Input placeholder="目标 IP / 域名" style={{width: '100%'}}/>
                     </Form.Item>
                 </Col>
                 <Col span={6}>
-                    <Form.Item name="target_port" label={t('stun.targetPort')}>
+                    <Form.Item
+                        name="target_port"
+                        label={t('stun.targetPort')}
+                        rules={[{required: true, message: '请填写目标端口'}]}
+                    >
                         <InputNumber min={1} max={65535} style={{width: '100%'}} placeholder="端口"/>
                     </Form.Item>
                 </Col>
@@ -830,6 +848,14 @@ const Stun: React.FC = () => {
                             <Col span={12}>
                                 <Text type="secondary">NAT 类型</Text>
                                 <div><Tag color="blue">{detailRecord.nat_type || '未知'}</Tag></div>
+                                {detailRecord.nat_type && natGuidance(detailRecord.nat_type) && (
+                                    <Alert
+                                        style={{marginTop: 6}}
+                                        type="warning"
+                                        showIcon
+                                        message={natGuidance(detailRecord.nat_type)}
+                                    />
+                                )}
                             </Col>
                             <Col span={12}>
                                 <Text type="secondary">STUN 服务器</Text>
